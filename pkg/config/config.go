@@ -61,7 +61,6 @@ type Config struct {
 	Context struct {
 		IncludeFileNames     bool   `yaml:"include_file_names"`                 // Include file names in the context
 		IncludeDiff          bool   `yaml:"include_diff"`                       // Include the diff in the context
-		MaxContextLength     int    `yaml:"max_context_length"`                 // Maximum length for the context (deprecated, use MaxInputTokens)
 		IncludeFileStats     bool   `yaml:"include_file_stats"`                 // Include stats about file changes (+/- lines)
 		IncludeFileSummaries bool   `yaml:"include_file_summaries"`             // Include brief description of what each file does
 		ShowFirstLinesOfFile int    `yaml:"show_first_lines_of_file,omitempty"` // Show first N lines of each file for better context
@@ -102,7 +101,6 @@ func DefaultConfig() *Config {
 	// Default context settings
 	cfg.Context.IncludeFileNames = true
 	cfg.Context.IncludeDiff = true
-	cfg.Context.MaxContextLength = 4000 // Deprecated, kept for backward compatibility
 	cfg.Context.IncludeFileStats = false
 	cfg.Context.IncludeFileSummaries = false
 	cfg.Context.ShowFirstLinesOfFile = 0

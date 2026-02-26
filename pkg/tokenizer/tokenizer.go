@@ -82,7 +82,7 @@ func GetProviderTokenLimit(provider string, model string) int {
 		if strings.Contains(model, "o1") || strings.Contains(model, "o3") {
 			return 100000 // o1 and o3 models have 128K+ context
 		}
-		return 100000 // Default for unknown OpenAI models
+		return 128000 // Default for unknown OpenAI models (128K context)
 
 	case "claude":
 		// Claude models typically have large context windows

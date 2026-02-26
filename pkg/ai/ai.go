@@ -880,10 +880,9 @@ func GenerateCommitMessage(cfg *config.Config, files []string, changes string) (
 	}
 
 	inputTokens := tokenizer.CountTokens(changes, tokenizerModel)
-	providerLimit := tokenizer.GetProviderTokenLimit(string(cfg.AI.Provider), cfg.AI.Model)
 	maxTokens := cfg.Context.MaxInputTokens
-	if maxTokens == 0 || maxTokens > providerLimit {
-		maxTokens = providerLimit // Use safe provider limit
+	if maxTokens == 0 {
+		maxTokens = tokenizer.GetProviderTokenLimit(string(cfg.AI.Provider), cfg.AI.Model)
 	}
 
 	// Reserve space for prompt overhead and response.
@@ -903,13 +902,12 @@ func GenerateCommitMessage(cfg *config.Config, files []string, changes string) (
 	// Debug: Show token analysis
 	if cfg.AI.Debug {
 		debugPrint(cfg, "TOKEN ANALYSIS", map[string]interface{}{
-			"input_tokens":         inputTokens,
-			"max_tokens":           maxTokens,
-			"provider_limit":       providerLimit,
-			"prompt_overhead":      promptOverhead,
-			"response_tokens":      responseTokens,
+			"input_tokens":          inputTokens,
+			"max_tokens":            maxTokens,
+			"prompt_overhead":       promptOverhead,
+			"response_tokens":       responseTokens,
 			"available_for_changes": availableForChanges,
-			"model":                tokenizerModel,
+			"model":                 tokenizerModel,
 		})
 	}
 
@@ -1629,7 +1627,7 @@ func generateWithOpenAI(cfg *config.Config, prompt string) (string, error) {
 	var response Response
 	err = json.Unmarshal(respData, &response)
 	if err != nil {
-		return "", err
+		return "", fmt.Errorf("error parsing API response: %w (response was: %s)", err, string(respData))
 	}
 
 	// Check for API error
