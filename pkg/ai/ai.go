@@ -886,18 +886,18 @@ func GenerateCommitMessage(cfg *config.Config, files []string, changes string) (
 		maxTokens = providerLimit // Use safe provider limit
 	}
 
-	// Reserve space for prompt overhead and response
-	// Prompt overhead: instructions, file info, etc. (~15K tokens typical)
+	// Reserve space for prompt overhead and response.
+	// Prompt overhead: system prompt + user message instructions (~4K tokens actual).
 	// Response: cfg.AI.MaxTokens (usually 1000-5000)
-	promptOverhead := 15000
+	promptOverhead := 4000
 	responseTokens := cfg.AI.MaxTokens
 	if responseTokens == 0 {
 		responseTokens = 5000
 	}
-	// Calculate available space for changes (50% of remaining space to be safe)
-	availableForChanges := (maxTokens - promptOverhead - responseTokens) / 2
-	if availableForChanges < 10000 {
-		availableForChanges = 10000 // Minimum 10K tokens for changes
+	// Calculate available space for changes
+	availableForChanges := maxTokens - promptOverhead - responseTokens
+	if availableForChanges < 500 {
+		availableForChanges = 500 // Minimum viable budget for changes
 	}
 
 	// Debug: Show token analysis
@@ -996,7 +996,7 @@ func GenerateCommitMessage(cfg *config.Config, files []string, changes string) (
 	if finalResponseTokens == 0 {
 		finalResponseTokens = 5000
 	}
-	safeLimit := maxTokens - finalResponseTokens - 5000 // Extra buffer for safety
+	safeLimit := maxTokens - finalResponseTokens - 2000 // Buffer for system message overhead
 
 	if cfg.AI.Debug {
 		debugPrint(cfg, "FINAL TOKEN CHECK", map[string]interface{}{
