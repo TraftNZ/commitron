@@ -100,7 +100,7 @@ jobs:
 
       # Upload the binary as an artifact for this workflow run
       - name: Upload artifact
-        uses: actions/upload-artifact@v3
+        uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.asset_name }}
           path: ${{ matrix.artifact_name }}
@@ -117,7 +117,7 @@ jobs:
 
       # Download all artifacts from the build job
       - name: Download artifacts
-        uses: actions/download-artifact@v3
+        uses: actions/download-artifact@v4
         with:
           path: ./artifacts
 
