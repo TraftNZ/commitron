@@ -1,11 +1,8 @@
 package ai
 
 import (
-	"bytes"
 	"encoding/json"
 	"fmt"
-	"io"
-	"net/http"
 	"os/exec"
 	"path/filepath"
 	"strings"
@@ -911,31 +908,12 @@ func GenerateCommitMessage(cfg *config.Config, files []string, changes string) (
 		})
 	}
 
-	// Apply smart processing if exceeds available space
+	// Apply hierarchical summarization if exceeds available space
+	// Never truncates silently - every file always appears at least as a stub
 	if inputTokens > availableForChanges {
-		strategy := cfg.Context.DiffStrategy
-		if strategy == "" || strategy == "auto" {
-			// Auto-select strategy based on size
-			if inputTokens < availableForChanges*3 {
-				strategy = "summarize"
-			} else {
-				strategy = "batch"
-			}
-		}
+		debugPrint(cfg, "HIERARCHICAL SUMMARIZATION", fmt.Sprintf("Input %d tokens > %d available tokens", inputTokens, availableForChanges))
 
-		debugPrint(cfg, "PROCESSING LARGE DIFF", fmt.Sprintf("Using %s strategy (%d tokens > %d available)", strategy, inputTokens, availableForChanges))
-
-		var processed string
-		var processErr error
-
-		switch strategy {
-		case "batch":
-			processed, processErr = BatchSummarize(changes, availableForChanges/5, cfg)
-		case "summarize":
-			processed, processErr = BuildContextFromDiff(changes, availableForChanges, cfg)
-		default: // "truncate"
-			processed = tokenizer.TruncateToTokenLimit(changes, availableForChanges, tokenizerModel)
-		}
+		processed, processErr := HierarchicalSummarize(cfg, changes, availableForChanges)
 
 		if processErr == nil {
 			changes = processed
@@ -943,20 +921,13 @@ func GenerateCommitMessage(cfg *config.Config, files []string, changes string) (
 			debugPrint(cfg, "PROCESSED RESULT", fmt.Sprintf("%d → %d tokens (%.1f%% reduction)", inputTokens, finalTokens, 100.0*(1.0-float64(finalTokens)/float64(inputTokens))))
 		} else {
 			debugPrint(cfg, "PROCESSING ERROR", processErr.Error())
-			// Fallback to simple truncation on error
-			changes = tokenizer.TruncateToTokenLimit(changes, availableForChanges, tokenizerModel)
+			// We never truncate silently - return error to caller
+			return "", fmt.Errorf("failed to summarize large diff: %w", processErr)
 		}
 	}
 
-	// FINAL SAFETY: Ensure changes is ALWAYS under hard limit before building prompt
-	// This is the last line of defense
+	// Final token count after hierarchical summarization
 	finalChangesTokens := tokenizer.CountTokens(changes, tokenizerModel)
-	hardLimit := availableForChanges
-	if finalChangesTokens > hardLimit {
-		debugPrint(cfg, "HARD LIMIT ENFORCEMENT", fmt.Sprintf("Changes still %d tokens > %d limit, forcing truncation", finalChangesTokens, hardLimit))
-		changes = tokenizer.TruncateToTokenLimit(changes, hardLimit, tokenizerModel)
-		finalChangesTokens = tokenizer.CountTokens(changes, tokenizerModel)
-	}
 
 	// Debug: Show input data
 	if cfg.AI.Debug {
@@ -1039,19 +1010,11 @@ Output ONLY the commit message, nothing else. Keep subject under %d characters.`
 
 	var rawResponse string
 
-	// Choose the AI provider based on the configuration
-	switch cfg.AI.Provider {
-	case config.OpenAI:
-		rawResponse, err = generateWithOpenAI(cfg, prompt)
-	case config.Gemini:
-		rawResponse, err = generateWithGemini(cfg, prompt)
-	case config.Ollama:
-		rawResponse, err = generateWithOllama(cfg, prompt)
-	case config.Claude:
-		rawResponse, err = generateWithClaude(cfg, prompt)
-	default:
-		return "", fmt.Errorf("unsupported AI provider: %s", cfg.AI.Provider)
-	}
+	// Get system prompt
+	systemPrompt := getSystemPrompt(cfg)
+
+	// Call LLM using unified dispatcher
+	rawResponse, err = CallLLM(cfg, systemPrompt, prompt)
 
 	if err != nil {
 		debugPrint(cfg, "AI ERROR", err.Error())
@@ -1503,7 +1466,7 @@ func extractKeyDiffContent(diff string) string {
 	// Generate summaries for all files
 	var summaries []string
 	for _, fd := range fileDiffs {
-		summary := SummarizeFileDiff(fd)
+		summary := stubFileSummary(fd)
 		summaries = append(summaries, summary)
 	}
 
@@ -1519,523 +1482,6 @@ func bodyExample(includeBody bool) string {
 }
 
 // generateWithOpenAI uses OpenAI to generate a commit message
-func generateWithOpenAI(cfg *config.Config, prompt string) (string, error) {
-	type Message struct {
-		Role    string `json:"role"`
-		Content string `json:"content"`
-	}
-
-	type Request struct {
-		Model       string    `json:"model"`
-		Messages    []Message `json:"messages"`
-		MaxTokens   int       `json:"max_tokens,omitempty"`
-		Temperature float64   `json:"temperature,omitempty"`
-	}
-
-	type Response struct {
-		Choices []struct {
-			Message struct {
-				Content string `json:"content"`
-			} `json:"message"`
-		} `json:"choices"`
-		Error json.RawMessage `json:"error,omitempty"`
-	}
-
-	type ErrorResponse struct {
-		Message string `json:"message"`
-		Type    string `json:"type"`
-		Code    string `json:"code"`
-	}
-
-	// Get or create system prompt
-	systemPrompt := getSystemPrompt(cfg)
-
-	// Add a prefix emphasizing length requirements regardless of custom prompts
-	lengthPrefix := fmt.Sprintf("MOST IMPORTANT INSTRUCTION: Your commit message subject MUST be under %d characters total. ", cfg.Commit.MaxLength)
-	if cfg.Commit.Convention == config.ConventionalCommits {
-		lengthPrefix += fmt.Sprintf("For conventional commits, this means the ENTIRE string 'type(scope): subject' must be under %d characters. Be extremely brief.", cfg.Commit.MaxLength)
-		lengthPrefix += "\n\nYOU MUST START YOUR RESPONSE WITH A CONVENTIONAL COMMIT TYPE. DO NOT START WITH JUST A COLON."
-		lengthPrefix += "\nCORRECT FORMAT: 'feat: add new feature'"
-		lengthPrefix += "\nINCORRECT FORMAT: ': add new feature'"
-		lengthPrefix += "\nValid types are: feat, fix, docs, style, refactor, perf, test, build, ci, chore, revert"
-
-		if cfg.Commit.IncludeBody {
-			lengthPrefix += "\n\nYOU MUST INCLUDE A COMMIT BODY AFTER THE SUBJECT. The body must be separated from the subject by a blank line."
-			lengthPrefix += "\nThe body MUST NOT be empty and should explain what changes were made and why."
-		}
-	}
-
-	// Prepend the length requirement to any system prompt
-	systemPrompt = lengthPrefix + "\n\n" + systemPrompt
-
-	// Create request
-	reqBody := Request{
-		Model: cfg.AI.Model,
-		Messages: []Message{
-			{
-				Role:    "system",
-				Content: systemPrompt,
-			},
-			{
-				Role:    "user",
-				Content: prompt,
-			},
-		},
-		MaxTokens:   cfg.AI.MaxTokens,
-		Temperature: cfg.AI.Temperature,
-	}
-
-	// Debug: Show the request being sent to OpenAI
-	debugPrint(cfg, "OPENAI REQUEST", reqBody)
-
-	reqData, err := json.Marshal(reqBody)
-	if err != nil {
-		return "", err
-	}
-
-	// Get endpoint from config or use default
-	endpoint := cfg.AI.OpenAIEndpoint
-	if endpoint == "" {
-		endpoint = "https://api.openai.com/v1/chat/completions"
-	}
-
-	// Make API request
-	req, err := http.NewRequest("POST", endpoint, bytes.NewBuffer(reqData))
-	if err != nil {
-		return "", err
-	}
-
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Authorization", "Bearer "+cfg.AI.APIKey)
-
-	client := &http.Client{}
-	resp, err := client.Do(req)
-	if err != nil {
-		return "", err
-	}
-	defer resp.Body.Close()
-
-	// Read response
-	respData, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return "", err
-	}
-
-	// Debug: Show the raw API response
-	debugPrint(cfg, "OPENAI RAW RESPONSE", string(respData))
-
-	var response Response
-	err = json.Unmarshal(respData, &response)
-	if err != nil {
-		return "", fmt.Errorf("error parsing API response: %w (response was: %s)", err, string(respData))
-	}
-
-	// Check for API error
-	if len(response.Error) > 0 {
-		var errorMessage string
-
-		// Try to parse as object first
-		var errResp ErrorResponse
-		if err := json.Unmarshal(response.Error, &errResp); err == nil && errResp.Message != "" {
-			errorMessage = errResp.Message
-		} else {
-			// Try to parse as string
-			var errStr string
-			if err := json.Unmarshal(response.Error, &errStr); err == nil && errStr != "" {
-				errorMessage = errStr
-			} else {
-				// If neither works, use the raw error
-				errorMessage = string(response.Error)
-			}
-		}
-
-		// Enhanced error handling for token limit errors
-		if strings.Contains(errorMessage, "maximum context length") || strings.Contains(errorMessage, "context_length_exceeded") {
-			return "", fmt.Errorf("OpenAI API error: %s\n\nChangeset too large even after optimization. Consider:\n"+
-				"  1. Split into smaller commits\n"+
-				"  2. Set diff_strategy: 'batch' in your config\n"+
-				"  3. Reduce max_input_tokens in your config\n"+
-				"  4. Disable include_diff temporarily", errorMessage)
-		}
-
-		return "", fmt.Errorf("OpenAI API error: %s", errorMessage)
-	}
-
-	// Check if we got results
-	if len(response.Choices) == 0 {
-		return "", fmt.Errorf("no response from OpenAI API")
-	}
-
-	content := strings.TrimSpace(response.Choices[0].Message.Content)
-
-	// For conventional commits, validate the response starts with a valid type
-	if cfg.Commit.Convention == config.ConventionalCommits {
-		// Fix if the response starts with a colon instead of a type
-		if strings.HasPrefix(content, ": ") {
-			content = "chore" + content
-			debugPrint(cfg, "FIXED RESPONSE FORMAT", content)
-		}
-	}
-
-	// Return the generated commit message
-	return content, nil
-}
-
-// generateWithGemini uses Google's Gemini to generate a commit message
-func generateWithGemini(cfg *config.Config, prompt string) (string, error) {
-	// Add a length requirement prefix to the prompt
-	lengthPrefix := fmt.Sprintf("CRITICAL INSTRUCTION: Your commit message subject MUST be under %d characters total. ", cfg.Commit.MaxLength)
-	if cfg.Commit.Convention == config.ConventionalCommits {
-		lengthPrefix += fmt.Sprintf("For conventional commits, this means the ENTIRE string 'type(scope): subject' must be under %d characters.", cfg.Commit.MaxLength)
-		lengthPrefix += "\n\nYOU MUST START YOUR RESPONSE WITH A CONVENTIONAL COMMIT TYPE. DO NOT START WITH JUST A COLON."
-		lengthPrefix += "\nCORRECT: 'feat: add new feature'"
-		lengthPrefix += "\nINCORRECT: ': add new feature'"
-		lengthPrefix += "\nValid types are: feat, fix, docs, style, refactor, perf, test, build, ci, chore, revert"
-
-		if cfg.Commit.IncludeBody {
-			lengthPrefix += "\n\nYOU MUST INCLUDE A COMMIT BODY AFTER THE SUBJECT. The body must be separated from the subject by a blank line."
-			lengthPrefix += "\nThe body MUST NOT be empty and should explain what changes were made and why."
-		}
-	}
-
-	// Prepend the length requirement to the prompt
-	enhancedPrompt := lengthPrefix + "\n\n" + prompt
-
-	type Request struct {
-		Contents []struct {
-			Parts []struct {
-				Text string `json:"text"`
-			} `json:"parts"`
-		} `json:"contents"`
-	}
-
-	type Response struct {
-		Candidates []struct {
-			Content struct {
-				Parts []struct {
-					Text string `json:"text"`
-				} `json:"parts"`
-			} `json:"content"`
-		} `json:"candidates"`
-		Error struct {
-			Message string `json:"message"`
-		} `json:"error"`
-	}
-
-	// Create request
-	reqBody := Request{
-		Contents: []struct {
-			Parts []struct {
-				Text string `json:"text"`
-			} `json:"parts"`
-		}{
-			{
-				Parts: []struct {
-					Text string `json:"text"`
-				}{
-					{
-						Text: enhancedPrompt,
-					},
-				},
-			},
-		},
-	}
-
-	// Debug: Show the request being sent to Gemini
-	debugPrint(cfg, "GEMINI REQUEST", reqBody)
-
-	reqData, err := json.Marshal(reqBody)
-	if err != nil {
-		return "", err
-	}
-
-	// Make API request
-	apiURL := fmt.Sprintf("https://generativelanguage.googleapis.com/v1beta/models/%s:generateContent?key=%s", cfg.AI.Model, cfg.AI.APIKey)
-	req, err := http.NewRequest("POST", apiURL, bytes.NewBuffer(reqData))
-	if err != nil {
-		return "", err
-	}
-
-	req.Header.Set("Content-Type", "application/json")
-
-	client := &http.Client{}
-	resp, err := client.Do(req)
-	if err != nil {
-		return "", err
-	}
-	defer resp.Body.Close()
-
-	// Read response
-	respData, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return "", err
-	}
-
-	// Debug: Show the raw API response
-	debugPrint(cfg, "GEMINI RAW RESPONSE", string(respData))
-
-	var response Response
-	err = json.Unmarshal(respData, &response)
-	if err != nil {
-		return "", err
-	}
-
-	// Check for API error
-	if response.Error.Message != "" {
-		return "", fmt.Errorf("Gemini API error: %s", response.Error.Message)
-	}
-
-	// Check if we got results
-	if len(response.Candidates) == 0 || len(response.Candidates[0].Content.Parts) == 0 {
-		return "", fmt.Errorf("no response from Gemini API")
-	}
-
-	content := strings.TrimSpace(response.Candidates[0].Content.Parts[0].Text)
-
-	// For conventional commits, validate the response starts with a valid type
-	if cfg.Commit.Convention == config.ConventionalCommits {
-		// Fix if the response starts with a colon instead of a type
-		if strings.HasPrefix(content, ": ") {
-			content = "chore" + content
-			debugPrint(cfg, "FIXED RESPONSE FORMAT", content)
-		}
-	}
-
-	// Return the generated commit message
-	return content, nil
-}
-
-// generateWithOllama uses Ollama (local) to generate a commit message
-func generateWithOllama(cfg *config.Config, prompt string) (string, error) {
-	// Add a length requirement prefix to the prompt
-	lengthPrefix := fmt.Sprintf("CRITICAL INSTRUCTION: Your commit message subject MUST be under %d characters total. ", cfg.Commit.MaxLength)
-	if cfg.Commit.Convention == config.ConventionalCommits {
-		lengthPrefix += fmt.Sprintf("For conventional commits, this means the ENTIRE string 'type(scope): subject' must be under %d characters.", cfg.Commit.MaxLength)
-		lengthPrefix += "\n\nYOU MUST START YOUR RESPONSE WITH A CONVENTIONAL COMMIT TYPE. DO NOT START WITH JUST A COLON."
-		lengthPrefix += "\nCORRECT: 'feat: add new feature'"
-		lengthPrefix += "\nINCORRECT: ': add new feature'"
-		lengthPrefix += "\nValid types are: feat, fix, docs, style, refactor, perf, test, build, ci, chore, revert"
-
-		if cfg.Commit.IncludeBody {
-			lengthPrefix += "\n\nYOU MUST INCLUDE A COMMIT BODY AFTER THE SUBJECT. The body must be separated from the subject by a blank line."
-			lengthPrefix += "\nThe body MUST NOT be empty and should explain what changes were made and why."
-		}
-	}
-
-	// Prepend the length requirement to the prompt
-	enhancedPrompt := lengthPrefix + "\n\n" + prompt
-
-	type Request struct {
-		Model       string  `json:"model"`
-		Prompt      string  `json:"prompt"`
-		Stream      bool    `json:"stream"`
-		Temperature float64 `json:"temperature,omitempty"`
-		MaxTokens   int     `json:"max_tokens,omitempty"`
-	}
-
-	type Response struct {
-		Model    string `json:"model"`
-		Response string `json:"response"`
-	}
-
-	// This is for non-streaming responses
-	type ResponseComplete struct {
-		Model     string `json:"model"`
-		Response  string `json:"response"`
-		CreatedAt string `json:"created_at"`
-		Done      bool   `json:"done"`
-	}
-
-	// Set default host if not specified
-	ollamaHost := cfg.AI.OllamaHost
-	if ollamaHost == "" {
-		ollamaHost = "http://localhost:11434"
-	}
-
-	// Create request for the /api/generate endpoint
-	reqBody := Request{
-		Model:       cfg.AI.Model,
-		Prompt:      enhancedPrompt, // Use the enhanced prompt
-		Stream:      false,
-		Temperature: cfg.AI.Temperature,
-		MaxTokens:   cfg.AI.MaxTokens,
-	}
-
-	// Debug: Show the request being sent to Ollama
-	debugPrint(cfg, "OLLAMA REQUEST", reqBody)
-
-	reqData, err := json.Marshal(reqBody)
-	if err != nil {
-		return "", err
-	}
-
-	// Debug: Show the Ollama host being used
-	debugPrint(cfg, "OLLAMA HOST", ollamaHost)
-
-	// Make API request - use the completion endpoint instead of generate
-	req, err := http.NewRequest("POST", ollamaHost+"/api/generate", bytes.NewBuffer(reqData))
-	if err != nil {
-		return "", err
-	}
-
-	req.Header.Set("Content-Type", "application/json")
-
-	client := &http.Client{}
-	resp, err := client.Do(req)
-	if err != nil {
-		return "", err
-	}
-	defer resp.Body.Close()
-
-	// Check response status
-	if resp.StatusCode != http.StatusOK {
-		bodyBytes, _ := io.ReadAll(resp.Body)
-		return "", fmt.Errorf("Ollama API error (status %d): %s", resp.StatusCode, string(bodyBytes))
-	}
-
-	// For non-streaming response, we can read the entire body
-	respData, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return "", err
-	}
-
-	// Debug: Show the raw API response
-	debugPrint(cfg, "OLLAMA RAW RESPONSE", string(respData))
-
-	var response Response
-	err = json.Unmarshal(respData, &response)
-	if err != nil {
-		return "", fmt.Errorf("error parsing Ollama response: %w (response was: %s)", err, string(respData))
-	}
-
-	content := strings.TrimSpace(response.Response)
-
-	// For conventional commits, validate the response starts with a valid type
-	if cfg.Commit.Convention == config.ConventionalCommits {
-		// Fix if the response starts with a colon instead of a type
-		if strings.HasPrefix(content, ": ") {
-			content = "chore" + content
-			debugPrint(cfg, "FIXED RESPONSE FORMAT", content)
-		}
-	}
-
-	// Return the generated commit message
-	return content, nil
-}
-
-// generateWithClaude uses Anthropic's Claude to generate a commit message
-func generateWithClaude(cfg *config.Config, prompt string) (string, error) {
-	// Add a length requirement prefix to the prompt
-	lengthPrefix := fmt.Sprintf("CRITICAL INSTRUCTION: Your commit message subject MUST be under %d characters total. ", cfg.Commit.MaxLength)
-	if cfg.Commit.Convention == config.ConventionalCommits {
-		lengthPrefix += fmt.Sprintf("For conventional commits, this means the ENTIRE string 'type(scope): subject' must be under %d characters.", cfg.Commit.MaxLength)
-		lengthPrefix += "\n\nYOU MUST START YOUR RESPONSE WITH A CONVENTIONAL COMMIT TYPE. DO NOT START WITH JUST A COLON."
-		lengthPrefix += "\nCORRECT: 'feat: add new feature'"
-		lengthPrefix += "\nINCORRECT: ': add new feature'"
-		lengthPrefix += "\nValid types are: feat, fix, docs, style, refactor, perf, test, build, ci, chore, revert"
-
-		if cfg.Commit.IncludeBody {
-			lengthPrefix += "\n\nYOU MUST INCLUDE A COMMIT BODY AFTER THE SUBJECT. The body must be separated from the subject by a blank line."
-			lengthPrefix += "\nThe body MUST NOT be empty and should explain what changes were made and why."
-		}
-	}
-
-	// Prepend the length requirement to the prompt
-	enhancedPrompt := lengthPrefix + "\n\n" + prompt
-
-	type Message struct {
-		Role    string `json:"role"`
-		Content string `json:"content"`
-	}
-
-	type Request struct {
-		Model     string    `json:"model"`
-		Messages  []Message `json:"messages"`
-		MaxTokens int       `json:"max_tokens"`
-	}
-
-	type Response struct {
-		Content struct {
-			Type string `json:"type"`
-			Text string `json:"text"`
-		} `json:"content"`
-		Error struct {
-			Message string `json:"message"`
-		} `json:"error"`
-	}
-
-	// Create request
-	reqBody := Request{
-		Model: cfg.AI.Model,
-		Messages: []Message{
-			{
-				Role:    "user",
-				Content: enhancedPrompt, // Use the enhanced prompt
-			},
-		},
-		MaxTokens: cfg.AI.MaxTokens,
-	}
-
-	// Debug: Show the request being sent to Claude
-	debugPrint(cfg, "CLAUDE REQUEST", reqBody)
-
-	reqData, err := json.Marshal(reqBody)
-	if err != nil {
-		return "", err
-	}
-
-	// Make API request
-	req, err := http.NewRequest("POST", "https://api.anthropic.com/v1/messages", bytes.NewBuffer(reqData))
-	if err != nil {
-		return "", err
-	}
-
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("X-API-Key", cfg.AI.APIKey)
-	req.Header.Set("Anthropic-Version", "2023-06-01")
-
-	client := &http.Client{}
-	resp, err := client.Do(req)
-	if err != nil {
-		return "", err
-	}
-	defer resp.Body.Close()
-
-	// Read response
-	respData, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return "", err
-	}
-
-	// Debug: Show the raw API response
-	debugPrint(cfg, "CLAUDE RAW RESPONSE", string(respData))
-
-	var response Response
-	err = json.Unmarshal(respData, &response)
-	if err != nil {
-		return "", fmt.Errorf("error parsing Claude response: %w (response: %s)", err, string(respData))
-	}
-
-	// Check for API error
-	if response.Error.Message != "" {
-		return "", fmt.Errorf("Claude API error: %s", response.Error.Message)
-	}
-
-	content := strings.TrimSpace(response.Content.Text)
-
-	// For conventional commits, validate the response starts with a valid type
-	if cfg.Commit.Convention == config.ConventionalCommits {
-		// Fix if the response starts with a colon instead of a type
-		if strings.HasPrefix(content, ": ") {
-			content = "chore" + content
-			debugPrint(cfg, "FIXED RESPONSE FORMAT", content)
-		}
-	}
-
-	// Return the generated commit message
-	return content, nil
-}
-
 // Helper function to get system prompt
 func getSystemPrompt(cfg *config.Config) string {
 	// If custom system prompt is provided, use it

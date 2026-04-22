@@ -97,8 +97,9 @@ func parseSingleFileDiff(diff string) FileDiff {
 	return file
 }
 
-// SummarizeFileDiff creates a concise summary of a single file's changes
-func SummarizeFileDiff(fd FileDiff) string {
+// stubFileSummary creates a concise deterministic stub summary of a single file's changes
+// Used as fallback when LLM summarization fails or for pre-classified files
+func stubFileSummary(fd FileDiff) string {
 	var summary strings.Builder
 
 	// File header with status and line counts
@@ -325,134 +326,9 @@ func calculateFilePriority(file FileDiff) int {
 	return max(score, 0)
 }
 
-// BuildContextFromDiff intelligently builds context within token limits
+// BuildContextFromDiff intelligently builds context within token limits using hierarchical summarization
 func BuildContextFromDiff(diff string, maxTokens int, cfg *config.Config) (string, error) {
-	model := cfg.Context.TokenizerModel
-	if model == "" {
-		model = cfg.AI.Model
-	}
-
-	if !cfg.Context.SummarizationEnabled {
-		// Fallback to simple truncation
-		return tokenizer.TruncateToTokenLimit(diff, maxTokens, model), nil
-	}
-
-	// Parse and prioritize files
-	files := ParseDiffByFile(diff)
-	if len(files) == 0 {
-		// Can't parse diff format, fallback to truncation
-		return tokenizer.TruncateToTokenLimit(diff, maxTokens, model), nil
-	}
-
-	prioritized := PrioritizeFiles(files)
-
-	// Allocate token budget
-	var result strings.Builder
-	remainingTokens := maxTokens
-
-	result.WriteString("=== Diff Summary ===\n\n")
-	headerTokens := tokenizer.CountTokens(result.String(), model)
-	remainingTokens -= headerTokens
-
-	for _, file := range prioritized {
-		if remainingTokens <= 100 {
-			// Not enough budget left
-			result.WriteString(fmt.Sprintf("\n... and %d more files (truncated to fit token limit)\n", len(prioritized)-len(result.String())))
-			break
-		}
-
-		var fileContent string
-
-		// High priority files: try to include full diff
-		if file.Priority >= 100 && file.Tokens < remainingTokens/2 {
-			fileContent = file.Content
-		} else {
-			// Medium/low priority: use summary
-			fileContent = SummarizeFileDiff(file.FileDiff)
-		}
-
-		contentTokens := tokenizer.CountTokens(fileContent, model)
-
-		if contentTokens <= remainingTokens {
-			result.WriteString(fileContent)
-			result.WriteString("\n")
-			remainingTokens -= contentTokens
-		} else {
-			// Try summary if full content doesn't fit
-			summary := SummarizeFileDiff(file.FileDiff)
-			summaryTokens := tokenizer.CountTokens(summary, model)
-
-			if summaryTokens <= remainingTokens {
-				result.WriteString(summary)
-				result.WriteString("\n")
-				remainingTokens -= summaryTokens
-			} else {
-				// Not even summary fits, just show file name and stats
-				fileStats := fmt.Sprintf("File: %s (+%d, -%d)\n", file.Path, file.Added, file.Removed)
-				result.WriteString(fileStats)
-				remainingTokens -= tokenizer.CountTokens(fileStats, model)
-			}
-		}
-	}
-
-	return result.String(), nil
-}
-
-// BatchSummarize handles extremely large diffs by processing in batches
-func BatchSummarize(diff string, batchTokenSize int, cfg *config.Config) (string, error) {
-	model := cfg.Context.TokenizerModel
-	if model == "" {
-		model = cfg.AI.Model
-	}
-
-	files := ParseDiffByFile(diff)
-	if len(files) == 0 {
-		// Can't parse diff format, fallback to truncation
-		return tokenizer.TruncateToTokenLimit(diff, batchTokenSize*3, model), nil
-	}
-
-	prioritized := PrioritizeFiles(files)
-
-	// Group files into batches
-	var batches [][]FileWithPriority
-	var currentBatch []FileWithPriority
-	currentBatchTokens := 0
-
-	for _, file := range prioritized {
-		summary := SummarizeFileDiff(file.FileDiff)
-		summaryTokens := tokenizer.CountTokens(summary, model)
-
-		if currentBatchTokens+summaryTokens > batchTokenSize && len(currentBatch) > 0 {
-			// Start new batch
-			batches = append(batches, currentBatch)
-			currentBatch = []FileWithPriority{file}
-			currentBatchTokens = summaryTokens
-		} else {
-			currentBatch = append(currentBatch, file)
-			currentBatchTokens += summaryTokens
-		}
-	}
-
-	// Add final batch
-	if len(currentBatch) > 0 {
-		batches = append(batches, currentBatch)
-	}
-
-	// Summarize each batch
-	var result strings.Builder
-	result.WriteString(fmt.Sprintf("=== Large Changeset Summary (%d files in %d batches) ===\n\n", len(files), len(batches)))
-
-	for i, batch := range batches {
-		result.WriteString(fmt.Sprintf("--- Batch %d/%d ---\n", i+1, len(batches)))
-		for _, file := range batch {
-			summary := SummarizeFileDiff(file.FileDiff)
-			result.WriteString(summary)
-			result.WriteString("\n")
-		}
-		result.WriteString("\n")
-	}
-
-	return result.String(), nil
+	return HierarchicalSummarize(cfg, diff, maxTokens)
 }
 
 // min returns the minimum of two integers

@@ -1,6 +1,7 @@
 package config
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 
@@ -90,13 +91,13 @@ func DefaultConfig() *Config {
 	cfg.AI.Temperature = 0.7
 	cfg.AI.SystemPrompt = ""
 	cfg.AI.Debug = false
-	cfg.AI.MaxTokens = 4000
+	cfg.AI.MaxTokens = 8000
 
 	// Default commit settings
 	cfg.Commit.Convention = NoConvention
 	cfg.Commit.IncludeBody = true
 	cfg.Commit.MaxLength = 120
-	cfg.Commit.MaxBodyLength = 1000 // Default maximum body length
+	cfg.Commit.MaxBodyLength = 5000 // Default maximum body length
 
 	// Default context settings
 	cfg.Context.IncludeFileNames = true
@@ -126,6 +127,13 @@ func ParseConfig(data []byte) (*Config, error) {
 	err := yaml.Unmarshal(data, cfg)
 	if err != nil {
 		return nil, err
+	}
+
+	// Normalize diff strategy: "truncate" is deprecated - now an alias for auto/hierarchical
+	if cfg.Context.DiffStrategy == "truncate" {
+		// Emit one-time warning to stderr
+		fmt.Fprintf(os.Stderr, "warning: diff_strategy: 'truncate' is deprecated and will be ignored - hierarchical summarization is used for all strategies\n")
+		cfg.Context.DiffStrategy = "auto"
 	}
 
 	return cfg, nil
@@ -173,7 +181,7 @@ func SaveExampleConfig(path string) error {
 	cfg.AI.Model = "gpt-3.5-turbo"
 	cfg.AI.Temperature = 0.7 // Example temperature value
 	cfg.AI.Debug = false     // Set to true to see AI prompts and responses
-	cfg.AI.MaxTokens = 4000  // Maximum response tokens
+	cfg.AI.MaxTokens = 8000  // Maximum response tokens
 
 	// Example of a custom system prompt (commented out by default)
 	cfg.AI.SystemPrompt = "# Custom system prompt (uncomment to use)\n# You are an expert developer who writes clear, concise commit messages.\n# Always follow the conventional commits format and be specific."
