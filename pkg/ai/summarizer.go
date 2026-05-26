@@ -14,12 +14,12 @@ import (
 
 // Configuration constants - all internal, no exported config fields
 const (
-	maxDepth          = 4       // Maximum summarization rounds
-	minPerFileTokens  = 80      // Minimum tokens per file summary
-	maxPerFileTokens  = 600     // Maximum tokens per file summary
-	concurrencyLimit  = 4       // Maximum concurrent LLM calls for per-file summarization
-	minShrinkPercent  = 20      // Minimum shrink percentage to continue reduction
-	lastResortOverage = 10      // Allow up to 10% overage before failing
+	maxDepth          = 4   // Maximum summarization rounds
+	minPerFileTokens  = 80  // Minimum tokens per file summary
+	maxPerFileTokens  = 600 // Maximum tokens per file summary
+	concurrencyLimit  = 4   // Maximum concurrent LLM calls for per-file summarization
+	minChunkOutTokens = 120 // Minimum output token budget for a single reduce chunk
+	lastResortOverage = 10  // Allow up to 10% overage before failing
 )
 
 // fileClassification categorizes a file for handling
@@ -36,11 +36,11 @@ const (
 
 // processedFile represents a processed file with its summary/stub
 type processedFile struct {
-	Path         string
+	Path           string
 	Classification fileClassification
-	Content      string // Summary or stub or raw content
-	Tokens       int
-	Priority     int
+	Content        string // Summary or stub or raw content
+	Tokens         int
+	Priority       int
 }
 
 // HierarchicalSummarize performs hierarchical map-reduce summarization on a diff that fits within token budget.
@@ -82,9 +82,9 @@ func HierarchicalSummarize(cfg *config.Config, diff string, promptBudget int) (s
 	for _, fd := range fileDiffs {
 		class := classifyFile(fd)
 		pf := processedFile{
-			Path:         fd.Path,
+			Path:           fd.Path,
 			Classification: class,
-			Priority:     calculateFilePriority(fd),
+			Priority:       calculateFilePriority(fd),
 		}
 
 		// Generate stub for non-normal files
@@ -116,7 +116,7 @@ func HierarchicalSummarize(cfg *config.Config, diff string, promptBudget int) (s
 	}
 
 	debugPrint(cfg, "HIERARCHICAL CLASSIFICATION", map[string]any{
-		"total_files":  len(classifiedFiles),
+		"total_files":   len(classifiedFiles),
 		"needs_summary": len(normalFiles),
 	})
 
@@ -185,15 +185,15 @@ func HierarchicalSummarize(cfg *config.Config, diff string, promptBudget int) (s
 	depth := 0
 	for currentTokens > promptBudget && depth < maxDepth {
 		debugPrint(cfg, "REDUCE STAGE START", map[string]any{
-			"depth":       depth + 1,
-			"tokens":      currentTokens,
-			"budget":      promptBudget,
-			"max_depth":   maxDepth,
+			"depth":     depth + 1,
+			"tokens":    currentTokens,
+			"budget":    promptBudget,
+			"max_depth": maxDepth,
 		})
 
-		reduced, newTokens, err := reduceSummarize(cfg, current, currentTokens, promptBudget, depth+1)
+		reduced, newTokens, err := reduceSummarize(cfg, current, promptBudget, depth+1)
 		if err != nil {
-			// Reduction failed - use what we have if it's close enough
+			// Every chunk failed - use what we have if it's close enough
 			if float64(currentTokens)/float64(promptBudget) <= (1 + lastResortOverage/100.0) {
 				debugPrint(cfg, "REDUCE FAILED ACCEPT", fmt.Sprintf("%d tokens > %d budget (%d%% overage), accepting",
 					currentTokens, promptBudget, int(100*float64(currentTokens-promptBudget)/float64(promptBudget))))
@@ -202,40 +202,20 @@ func HierarchicalSummarize(cfg *config.Config, diff string, promptBudget int) (s
 			return "", fmt.Errorf("hierarchical summarization exhausted: %w", err)
 		}
 
-		// Check that we actually made progress
-		shrinkPercent := 100 * (currentTokens - newTokens) / currentTokens
-		if shrinkPercent < minShrinkPercent {
-			// Didn't shrink enough - try once with tighter budget then break
-			if depth == 0 {
-				debugPrint(cfg, "REDUCE INSUFFICIENT SHRINK", fmt.Sprintf("only %d%% shrink, needs %d%%, retrying with tighter budget",
-					shrinkPercent, minShrinkPercent))
-				// Retry with lower target
-				reduced, newTokens, err = reduceSummarizeWithTarget(cfg, current, promptBudget, promptBudget*3/4, depth+1)
-				if err != nil {
-					debugPrint(cfg, "SECOND REDUCE FAILED", err.Error())
-					break
-				}
-				shrinkPercent = 100 * (currentTokens - newTokens) / currentTokens
-				if shrinkPercent < minShrinkPercent/2 {
-					// Still not enough, give up
-					debugPrint(cfg, "SECOND REDUCE INSUFFICIENT", fmt.Sprintf("%d%% shrink, accepting what we have", shrinkPercent))
-					current = reduced
-					currentTokens = newTokens
-					break
-				}
-			} else {
-				debugPrint(cfg, "REDUCE INSUFFICIENT GIVEUP", fmt.Sprintf("%d%% shrink after depth %d, stopping", shrinkPercent, depth))
-				break
-			}
+		// Stop if a round made no progress; lastResortSortAndFit is the guaranteed floor.
+		if newTokens >= currentTokens {
+			debugPrint(cfg, "REDUCE NO PROGRESS", fmt.Sprintf("%d → %d tokens, stopping", currentTokens, newTokens))
+			break
 		}
 
+		shrinkPercent := 100 * (currentTokens - newTokens) / currentTokens
 		current = reduced
 		currentTokens = newTokens
 		depth++
 
 		debugPrint(cfg, "REDUCE STAGE COMPLETE", map[string]any{
-			"depth":         depth,
-			"tokens_after":  currentTokens,
+			"depth":          depth,
+			"tokens_after":   currentTokens,
 			"shrink_percent": shrinkPercent,
 		})
 	}
@@ -249,10 +229,10 @@ func HierarchicalSummarize(cfg *config.Config, diff string, promptBudget int) (s
 	}
 
 	debugPrint(cfg, "HIERARCHICAL SUMMARIZATION COMPLETE", map[string]any{
-		"final_tokens":   currentTokens,
-		"budget":         promptBudget,
-		"depth_used":     depth,
-		"reduction_pct":  100 * (inputTokens - currentTokens) / inputTokens,
+		"final_tokens":  currentTokens,
+		"budget":        promptBudget,
+		"depth_used":    depth,
+		"reduction_pct": 100 * (inputTokens - currentTokens) / inputTokens,
 	})
 
 	return current, nil
@@ -393,49 +373,37 @@ CRITICAL REQUIREMENTS:
 	return callLLMWithRetry(cfg, systemPrompt, userPrompt, 2)
 }
 
-// reduceSummarize groups the current summary into chunks and summarizes each chunk
-func reduceSummarize(cfg *config.Config, current string, currentTokens int, promptBudget int, depth int) (string, int, error) {
-	targetBudget := promptBudget / 2
-	return reduceSummarizeWithTarget(cfg, current, promptBudget, targetBudget, depth)
-}
-
-func reduceSummarizeWithTarget(cfg *config.Config, current string, promptBudget, targetBudget int, depth int) (string, int, error) {
+// reduceSummarize groups the current summary into chunks and summarizes each chunk to a
+// fraction of promptBudget, guaranteeing the combined output targets promptBudget rather
+// than merely passing content through.
+func reduceSummarize(cfg *config.Config, current string, promptBudget int, depth int) (string, int, error) {
 	tokenizerModel := cfg.Context.TokenizerModel
 	if tokenizerModel == "" {
 		tokenizerModel = cfg.AI.Model
 	}
 
-	// Split into lines and group into chunks <= targetBudget tokens
-	lines := strings.Split(current, "\n")
-	var chunks []string
-	var currentChunk strings.Builder
-	currentChunkTokens := 0
+	// Chunk on file/section boundaries (the map stage joins sections with blank lines),
+	// aiming each chunk's input at roughly promptBudget tokens.
+	chunks := chunkBySections(current, promptBudget, tokenizerModel)
 
-	for _, line := range lines {
-		lineTokens := tokenizer.CountTokens(line+"\n", tokenizerModel)
-		if currentChunkTokens+lineTokens > targetBudget && currentChunkTokens > 0 {
-			chunks = append(chunks, currentChunk.String())
-			currentChunk.Reset()
-			currentChunkTokens = 0
-		}
-		currentChunk.WriteString(line)
-		currentChunk.WriteString("\n")
-		currentChunkTokens += lineTokens
-	}
-
-	if currentChunkTokens > 0 {
-		chunks = append(chunks, currentChunk.String())
+	// Per-chunk OUTPUT budget is a true fraction of the total budget, independent of and
+	// smaller than each chunk's input size, so the combined output approaches promptBudget.
+	perChunkOut := promptBudget / len(chunks)
+	if perChunkOut < minChunkOutTokens {
+		perChunkOut = minChunkOutTokens
 	}
 
 	debugPrint(cfg, "REDUCE CHUNKING", map[string]any{
-		"depth":  depth,
-		"chunks": len(chunks),
+		"depth":         depth,
+		"chunks":        len(chunks),
+		"per_chunk_out": perChunkOut,
 	})
 
 	// Summarize each chunk concurrently with concurrency limit
 	var g errgroup.Group
 	g.SetLimit(concurrencyLimit)
 	results := make([]string, len(chunks))
+	failures := make([]bool, len(chunks))
 
 	for i, chunk := range chunks {
 		i := i
@@ -447,23 +415,37 @@ Summarize this chunk while PRESERVING:
 - All function/method names that changed
 - Any BREAKING CHANGE markers
 - The overall purpose of each change
-- Keep it concise but do not omit critical information
 
-Target maximum length: %d tokens`, targetBudget)
+You MUST compress aggressively. Target maximum length: %d tokens.`, perChunkOut)
 
 			userPrompt := fmt.Sprintf("Summarize this chunk of diff summaries:\n\n%s", chunk)
 
 			summary, err := callLLMWithRetry(cfg, systemPrompt, userPrompt, 1)
 			if err != nil {
-				return err
+				// Don't abort the whole reduce on one flaky call - keep the original
+				// chunk so its file paths and content survive into the next round.
+				debugPrint(cfg, "REDUCE CHUNK FAILED", fmt.Sprintf("chunk %d: %v, keeping original", i, err))
+				results[i] = chunk
+				failures[i] = true
+				return nil
 			}
 			results[i] = summary
 			return nil
 		})
 	}
 
-	if err := g.Wait(); err != nil {
-		return "", 0, err
+	_ = g.Wait()
+
+	// If every chunk failed, surface the error so the caller can decide.
+	allFailed := true
+	for _, f := range failures {
+		if !f {
+			allFailed = false
+			break
+		}
+	}
+	if allFailed {
+		return "", 0, fmt.Errorf("all %d reduce chunks failed", len(chunks))
 	}
 
 	// Combine results
@@ -478,6 +460,53 @@ Target maximum length: %d tokens`, targetBudget)
 	final := strings.TrimSpace(reduced.String())
 	finalTokens := tokenizer.CountTokens(final, tokenizerModel)
 	return final, finalTokens, nil
+}
+
+// chunkBySections groups blank-line-separated sections into chunks whose input size is
+// roughly chunkInputTarget tokens, preserving section (and thus file) boundaries. A single
+// oversized section becomes its own chunk rather than being split mid-content. The result
+// always has at least 2 chunks when the input exceeds chunkInputTarget, so the per-chunk
+// output budget computed by the caller forces real compression.
+func chunkBySections(current string, chunkInputTarget int, tokenizerModel string) []string {
+	sections := strings.Split(current, "\n\n")
+	var chunks []string
+	var b strings.Builder
+	chunkTokens := 0
+
+	flush := func() {
+		if b.Len() > 0 {
+			chunks = append(chunks, strings.TrimSpace(b.String()))
+			b.Reset()
+			chunkTokens = 0
+		}
+	}
+
+	for _, sec := range sections {
+		if strings.TrimSpace(sec) == "" {
+			continue
+		}
+		secTokens := tokenizer.CountTokens(sec, tokenizerModel)
+		if chunkTokens > 0 && chunkTokens+secTokens > chunkInputTarget {
+			flush()
+		}
+		b.WriteString(sec)
+		b.WriteString("\n\n")
+		chunkTokens += secTokens
+	}
+	flush()
+
+	if len(chunks) == 0 {
+		return []string{current}
+	}
+	// Guarantee compression is possible: if everything collapsed into one chunk but still
+	// exceeds the target, split it in half by sections.
+	if len(chunks) == 1 && tokenizer.CountTokens(chunks[0], tokenizerModel) > chunkInputTarget && len(sections) > 1 {
+		mid := len(sections) / 2
+		first := strings.TrimSpace(strings.Join(sections[:mid], "\n\n"))
+		second := strings.TrimSpace(strings.Join(sections[mid:], "\n\n"))
+		return []string{first, second}
+	}
+	return chunks
 }
 
 // lastResortSortAndFit sorts all files by priority and keeps top ones full, lower as stubs
@@ -534,12 +563,12 @@ func findFileDiffIndex(path string, fileDiffs []FileDiff) int {
 func extractHunkEnclosingFunc(hunkHeader string) string {
 	// Patterns to find function names after @@ marker
 	patterns := []*regexp.Regexp{
-		regexp.MustCompile(`@@.*@@\s+func\s+(\w+)`),                     // Go free function
-		regexp.MustCompile(`@@.*@@\s+func\s*\([^)]+\)\s*(\w+)`),        // Go method
-		regexp.MustCompile(`@@.*@@\s+function\s+(\w+)`),                // JS function
-		regexp.MustCompile(`@@.*@@\s+(\w+)\s*\([^)]*\)\s*{`),           // JS/TS/C/C++ function
-		regexp.MustCompile(`@@.*@@\s+def\s+(\w+)`),                      // Python function
-		regexp.MustCompile(`@@.*@@\s+class\s+(\w+)`),                    // Class definition
+		regexp.MustCompile(`@@.*@@\s+func\s+(\w+)`),             // Go free function
+		regexp.MustCompile(`@@.*@@\s+func\s*\([^)]+\)\s*(\w+)`), // Go method
+		regexp.MustCompile(`@@.*@@\s+function\s+(\w+)`),         // JS function
+		regexp.MustCompile(`@@.*@@\s+(\w+)\s*\([^)]*\)\s*{`),    // JS/TS/C/C++ function
+		regexp.MustCompile(`@@.*@@\s+def\s+(\w+)`),              // Python function
+		regexp.MustCompile(`@@.*@@\s+class\s+(\w+)`),            // Class definition
 	}
 
 	for _, pattern := range patterns {

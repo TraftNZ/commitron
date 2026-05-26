@@ -837,7 +837,7 @@ func DisplayCommitMessage(commitMsg string) (bool, error) {
 
 // DisplayAnalysisComplete prints a completion message
 func DisplayAnalysisComplete() {
-	fmt.Println("\033[1;32m✓ Analysis complete\033[0m\n")
+	fmt.Println("\033[1;32m✓ Analysis complete\033[0m")
 }
 
 // GetGitDiff returns clean git diff output for the staged files
