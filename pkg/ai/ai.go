@@ -270,10 +270,10 @@ func GenerateTextPrompt(cfg *config.Config, files []string, changes string) stri
 		"You are a git commit message generator. Output ONLY the commit message, nothing else.",
 		"DO NOT include any explanatory text, analysis, or preamble like 'Based on the git diff provided' or 'It appears that'.",
 		"Your response should be the raw commit message that will be passed directly to git commit.",
-		"Write CONCISE commit messages in present tense for the following code changes. Be brief and to the point.",
-		"BE EXTREMELY CONCISE. Remove all unnecessary words.",
-		"Prefer: 'Add user auth' over 'Add a new feature for user authentication'",
-		"Prefer: 'Fix parsing bug' over 'Fix a bug in the parsing logic'",
+		"Write commit messages in present tense for the following code changes.",
+		"Keep the SUBJECT line extremely concise; the body should be a thorough bulleted breakdown of the changes.",
+		"For the subject, prefer: 'Add user auth' over 'Add a new feature for user authentication'",
+		"For the subject, prefer: 'Fix parsing bug' over 'Fix a bug in the parsing logic'",
 	}
 
 	// Add specific format requirements for conventional commits first to emphasize importance
@@ -288,14 +288,17 @@ func GenerateTextPrompt(cfg *config.Config, files []string, changes string) stri
 
 	// Add body instructions based on configuration
 	if cfg.Commit.IncludeBody {
-		prompts = append(prompts, fmt.Sprintf("STRICT REQUIREMENT: Include a commit body that is a CONCISE NARRATIVE SUMMARY (1-3 sentences) and MUST NOT exceed %d characters. Write a cohesive paragraph explaining WHAT changed and WHY, not a list of individual changes. DO NOT use bullet points. DO NOT include line statistics (+/-), file lists, or raw metadata. FOCUS on the overall impact and purpose of the changes. Mention both additions AND deletions if significant. BODY IS ABSOLUTELY REQUIRED AND MUST NOT BE EMPTY. KEEP IT BRIEF - a short paragraph is better than a long list.", cfg.Commit.MaxBodyLength))
+		prompts = append(prompts, fmt.Sprintf("STRICT REQUIREMENT: Include a commit body that is a BULLETED LIST of the distinct changes, and MUST NOT exceed %d characters. Start EVERY bullet with '- '. Write ONE bullet per meaningful change, grouping related edits together. Cover ALL significant changes across the diff - the more files and areas touched, the more bullets you should include. Each bullet must be specific about WHAT changed (name the component, function, field, enum, or behavior) rather than vague. Mention both additions AND deletions when significant. DO NOT include line statistics (+/-), raw file paths as a bare list, or diff metadata. BODY IS ABSOLUTELY REQUIRED AND MUST NOT BE EMPTY.", cfg.Commit.MaxBodyLength))
 
 		prompts = append(prompts, "EXACT OUTPUT FORMAT EXAMPLE (your response should look exactly like this):")
-		prompts = append(prompts, "fix: Resolve blocking issue in damage check worker")
+		prompts = append(prompts, "feat(graphql): enhance schema with new assessment and user fields")
 		prompts = append(prompts, "")
-		prompts = append(prompts, "Refactored job processing to support concurrent execution by increasing prefetch count and removing blocking waits. Removed the synchronous processing loop and replaced with async task creation, allowing multiple damage checks to run in parallel without blocking the main worker thread.")
+		prompts = append(prompts, "- Added new enums for AssessmentType and LineItemType in the schema")
+		prompts = append(prompts, "- Updated UserType to include CUSTOMER, INSURER, and CLAIMANT")
+		prompts = append(prompts, "- Enhanced Property type with bedrooms and bathrooms fields")
+		prompts = append(prompts, "- Adjusted query fields to use tax instead of GST terminology")
 
-		prompts = append(prompts, "DO NOT add any text before or after this format. Start directly with the commit type. Write the body as a SHORT PARAGRAPH, not bullet points.")
+		prompts = append(prompts, "DO NOT add any text before or after this format. Start directly with the commit type, then a blank line, then the bulleted body.")
 	} else {
 		prompts = append(prompts, "Do not include a commit body, only provide the subject line.")
 	}
@@ -428,7 +431,7 @@ When analyzing the code changes:
 	}
 
 	// Final constraint to ensure clean output
-	prompts = append(prompts, "\nREMEMBER: Your response must be ONLY the commit message. Do not include any analysis, explanation, or extra text. Start immediately with the commit type. KEEP IT CONCISE AND FOCUSED.")
+	prompts = append(prompts, "\nREMEMBER: Your response must be ONLY the commit message. Do not include any analysis, explanation, or extra text. Start immediately with the commit type, followed by a blank line and a bulleted body that covers all significant changes.")
 
 	return strings.Join(prompts, "\n")
 }
@@ -1387,7 +1390,7 @@ func buildPrompt(cfg *config.Config, files []string, changes string) string {
 		// Add explicit instructions to return ONLY valid JSON
 		bodyInstructions := ""
 		if cfg.Commit.IncludeBody {
-			bodyInstructions = "YOU MUST INCLUDE A BODY. The body must be VERY CONCISE, direct, and technical - focusing only on actual changes made. Keep it brief and to the point. DO NOT include line statistics, file lists, or formatting details like '+X/-Y lines'. DO NOT include raw metadata from the diff. NO marketing language or fluffy descriptions. Use clear, short bullet points. "
+			bodyInstructions = "YOU MUST INCLUDE A BODY formatted as a bulleted list, with every bullet starting with '- '. Include one bullet per meaningful change and cover ALL significant changes across the diff - more files/areas touched means more bullets. Each bullet must be specific and technical about what actually changed (name the component, function, or behavior). DO NOT include line statistics or formatting details like '+X/-Y lines'. DO NOT include raw metadata from the diff. NO marketing language or fluffy descriptions. "
 		} else {
 			bodyInstructions = "DO NOT include a body. "
 		}
@@ -1476,7 +1479,7 @@ func extractKeyDiffContent(diff string) string {
 // bodyExample returns the appropriate body example text based on whether body is included
 func bodyExample(includeBody bool) string {
 	if includeBody {
-		return "This commit adds critical validation for commit messages to ensure they follow the conventional commit format. The changes include improved error handling, automatic truncation of long messages, and proper formatting of the commit type and subject."
+		return "- Added validation to ensure commit messages follow the conventional commit format\\n- Improved error handling for malformed messages\\n- Added automatic truncation of overly long subject lines"
 	}
 	return "leave empty"
 }
@@ -1507,7 +1510,7 @@ func getSystemPrompt(cfg *config.Config) string {
 
 		// Add body instructions
 		if cfg.Commit.IncludeBody {
-			promptParts = append(promptParts, fmt.Sprintf("STRICT REQUIREMENT: Body is REQUIRED and MUST NOT be empty. Body MUST be EXTREMELY BRIEF and MUST NOT exceed %d characters. Use a terse, minimal style focused only on essential technical changes. NEVER include statistics, file lists, or metadata. PRIORITIZE BREVITY ABOVE ALL ELSE.", cfg.Commit.MaxBodyLength))
+			promptParts = append(promptParts, fmt.Sprintf("STRICT REQUIREMENT: Body is REQUIRED and MUST NOT be empty. Format the body as a BULLETED LIST, with every bullet starting with '- '. Include one bullet per meaningful change and cover ALL significant changes across the diff - more files/areas touched means more bullets. Each bullet MUST be specific about what changed (name the component, function, field, or behavior). The body MUST NOT exceed %d characters. NEVER include line statistics (+/-) or raw diff metadata.", cfg.Commit.MaxBodyLength))
 		} else {
 			promptParts = append(promptParts, "Do not include a commit body, only provide the subject line.")
 		}
