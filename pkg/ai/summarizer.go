@@ -17,7 +17,7 @@ const (
 	maxDepth          = 4   // Maximum summarization rounds
 	minPerFileTokens  = 80  // Minimum tokens per file summary
 	maxPerFileTokens  = 600 // Maximum tokens per file summary
-	concurrencyLimit  = 4   // Maximum concurrent LLM calls for per-file summarization
+	concurrencyLimit  = 12  // Maximum concurrent LLM calls for per-file summarization
 	minChunkOutTokens = 120 // Minimum output token budget for a single reduce chunk
 	lastResortOverage = 10  // Allow up to 10% overage before failing
 )
@@ -268,24 +268,36 @@ func classifyFile(fd FileDiff) fileClassification {
 	return classNormal
 }
 
-// isGenerated checks if a file path matches known generated/lockfile patterns
+// isGenerated checks if a file path matches known generated/lockfile/vendored patterns.
+// Such files are stubbed deterministically and never sent to the LLM, since they carry
+// little signal for a commit message yet can dominate the per-file summarization cost.
 func isGenerated(path string) bool {
 	base := filepath.Base(path)
 	switch base {
-	case "go.sum", "package-lock.json", "yarn.lock", "pnpm-lock.yaml", "Cargo.lock":
+	case "go.sum", "go.work.sum", "package-lock.json", "yarn.lock", "pnpm-lock.yaml",
+		"Cargo.lock", "Gemfile.lock", "poetry.lock", "composer.lock", "Pipfile.lock",
+		"flake.lock":
 		return true
 	}
 
-	ext := strings.ToLower(filepath.Ext(path))
-	if ext == ".min.js" || ext == ".min.css" {
+	lower := strings.ToLower(path)
+	if strings.HasSuffix(lower, ".min.js") || strings.HasSuffix(lower, ".min.css") ||
+		strings.HasSuffix(lower, ".map") {
 		return true
 	}
 
-	// Check patterns
-	if strings.Contains(path, "/vendor/") || strings.Contains(path, "/dist/") {
-		return true
+	// Vendored / third-party / generated directories anywhere in the path.
+	for _, dir := range []string{"vendor", "third_party", "third-party", "node_modules",
+		"dist", "build", "generated", "__generated__", ".next"} {
+		if strings.Contains(path, "/"+dir+"/") || strings.HasPrefix(path, dir+"/") {
+			return true
+		}
 	}
-	if strings.HasSuffix(path, ".pb.go") || strings.HasSuffix(path, "_generated.go") {
+
+	if strings.HasSuffix(path, ".pb.go") || strings.HasSuffix(path, ".pb.gw.go") ||
+		strings.HasSuffix(path, "_generated.go") || strings.HasSuffix(path, ".gen.go") ||
+		strings.HasSuffix(path, ".g.dart") || strings.HasSuffix(path, ".freezed.dart") ||
+		strings.HasSuffix(path, "_pb2.py") || strings.HasSuffix(path, "_pb2_grpc.py") {
 		return true
 	}
 

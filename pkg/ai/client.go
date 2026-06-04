@@ -14,6 +14,13 @@ import (
 	"github.com/johnstilia/commitron/pkg/config"
 )
 
+// httpClient is shared across all provider calls. A bounded timeout prevents a single
+// stalled connection from hanging the whole run indefinitely - the dominant failure mode
+// when summarizing large diffs across many concurrent requests.
+var httpClient = &http.Client{
+	Timeout: 120 * time.Second,
+}
+
 // CallLLM calls the configured AI provider with the given system and user prompts.
 // It handles provider-specific prompt formatting uniformly for both summarization and final commit generation.
 // For the final commit message generation, streaming is enabled to show output as it arrives.
@@ -111,8 +118,7 @@ func callOpenAI(cfg *config.Config, systemPrompt, userPrompt string, stream bool
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Authorization", "Bearer "+cfg.AI.APIKey)
 
-	client := &http.Client{}
-	resp, err := client.Do(req)
+	resp, err := httpClient.Do(req)
 	if err != nil {
 		return "", err
 	}
@@ -280,8 +286,7 @@ func callGemini(cfg *config.Config, systemPrompt, userPrompt string) (string, er
 
 	req.Header.Set("Content-Type", "application/json")
 
-	client := &http.Client{}
-	resp, err := client.Do(req)
+	resp, err := httpClient.Do(req)
 	if err != nil {
 		return "", err
 	}
@@ -359,8 +364,7 @@ func callOllama(cfg *config.Config, systemPrompt, userPrompt string, stream bool
 
 	req.Header.Set("Content-Type", "application/json")
 
-	client := &http.Client{}
-	resp, err := client.Do(req)
+	resp, err := httpClient.Do(req)
 	if err != nil {
 		return "", err
 	}
@@ -481,8 +485,7 @@ func callClaude(cfg *config.Config, systemPrompt, userPrompt string) (string, er
 	req.Header.Set("X-API-Key", cfg.AI.APIKey)
 	req.Header.Set("Anthropic-Version", "2023-06-01")
 
-	client := &http.Client{}
-	resp, err := client.Do(req)
+	resp, err := httpClient.Do(req)
 	if err != nil {
 		return "", err
 	}
