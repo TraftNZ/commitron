@@ -538,6 +538,16 @@ var summarizeCall = func(cfg *config.Config, systemPrompt, userPrompt string) (s
 	}
 }
 
+// withMaxTokens returns a shallow copy of cfg with the response token cap overridden.
+// Summarization calls must not inherit the user's large response budget (meant for the
+// final commit message): an uncapped max_tokens lets the model generate tens of thousands
+// of tokens per summary, which is the dominant cost on local serial inference servers.
+func withMaxTokens(cfg *config.Config, maxTokens int) *config.Config {
+	c := *cfg
+	c.AI.MaxTokens = maxTokens
+	return &c
+}
+
 // callLLMWithRetry calls summarizeCall with retries and exponential backoff on failure.
 // Used for summarization steps where individual failures can be retried.
 // Summarization never uses streaming since we just need the full summary to continue.

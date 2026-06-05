@@ -21,6 +21,16 @@ const (
 	minChunkOutTokens           = 120 // Minimum output token budget for a single reduce chunk
 	lastResortOverage           = 10  // Allow up to 10% overage before failing
 	summarizationSavingsPadding = 200 // Extra expected savings to avoid a reduce pass after map summarization
+
+	// Reduce-stage bounds: local serial inference servers spend minutes on huge prompts or
+	// unbounded generation, which is what used to blow the request timeout and fail chunks.
+	maxChunkInTokens  = 24000 // Maximum input tokens per reduce chunk (bounds prompt-eval time per call)
+	maxChunkOutTokens = 2000  // Maximum output token budget per reduce chunk (bounds generation time)
+	perFileRetries    = 2     // Retries for per-file summarization calls
+	reduceRetries     = 2     // Retries for reduce-chunk summarization calls
+	// genHeadroomFactor converts a summary's target length into the request's max_tokens cap,
+	// leaving slack so the model isn't cut off mid-summary when it slightly overshoots.
+	genHeadroomFactor = 2
 )
 
 // fileClassification categorizes a file for handling
@@ -111,7 +121,10 @@ func HierarchicalSummarize(cfg *config.Config, diff string, promptBudget int) (s
 		case classEmpty:
 			pf.Content = fmt.Sprintf("%s: no content change", fd.Path)
 		default: // classNormal
-			pf.Content = fd.Content
+			// Strip unchanged context lines before any LLM work: they typically dominate
+			// the token count of a diff yet carry no signal for a commit message. This
+			// often shrinks the diff enough to skip per-file LLM summarization entirely.
+			pf.Content = stripContextLines(fd.Content)
 			totalPriority += pf.Priority
 		}
 
@@ -262,6 +275,29 @@ func classifyFile(fd FileDiff) fileClassification {
 	return classNormal
 }
 
+// stripContextLines removes unchanged context and noisy metadata lines from a unified
+// diff, keeping only added/removed lines and hunk/file headers. Context lines usually
+// dominate a diff's token count yet carry no signal for a commit message.
+func stripContextLines(content string) string {
+	lines := strings.Split(content, "\n")
+	kept := make([]string, 0, len(lines))
+	for _, line := range lines {
+		if line == "" {
+			continue
+		}
+		// Context lines in unified diff format start with a single space.
+		if strings.HasPrefix(line, " ") {
+			continue
+		}
+		// Drop noisy metadata lines that carry no commit-message signal.
+		if strings.HasPrefix(line, "index ") || strings.HasPrefix(line, "similarity index") {
+			continue
+		}
+		kept = append(kept, line)
+	}
+	return strings.Join(kept, "\n")
+}
+
 // isGenerated checks if a file path matches known generated/lockfile/vendored patterns.
 // Such files are stubbed deterministically and never sent to the LLM, since they carry
 // little signal for a commit message yet can dominate the per-file summarization cost.
@@ -406,7 +442,7 @@ CRITICAL REQUIREMENTS:
 - Preserve ALL important information:
   * Which functions/methods were added/removed/modified (extract from @@ ... @@ hunk headers)
   * What behavior changed (added, removed, modified functionality)
-  * Any BREAKING CHANGE markers or API changes
+  * BREAKING CHANGE markers, but ONLY if they literally appear in the diff - never label a change as breaking yourself
   * Deletions that affect public API
 - Format as a bullet list with file path as heading
 - Focus on what the change does, not the exact line numbers
@@ -414,8 +450,9 @@ CRITICAL REQUIREMENTS:
 
 	userPrompt := fmt.Sprintf("Summarize this git diff:\n\n```diff\n%s\n```", content)
 
-	// Retry up to 2 times on failure
-	return callLLMWithRetry(cfg, systemPrompt, userPrompt, 2)
+	// Cap generation at the summary target (plus headroom) instead of inheriting the
+	// user's full response budget - unbounded generation is the dominant latency cost.
+	return callLLMWithRetry(withMaxTokens(cfg, maxTokens*genHeadroomFactor), systemPrompt, userPrompt, perFileRetries)
 }
 
 // reduceSummarize groups the current summary into chunks and summarizes each chunk to a
@@ -427,13 +464,20 @@ func reduceSummarize(cfg *config.Config, current string, promptBudget int, depth
 		tokenizerModel = cfg.AI.Model
 	}
 
-	// Chunk on file/section boundaries (the map stage joins sections with blank lines),
-	// aiming each chunk's input at roughly promptBudget tokens.
-	chunks := chunkBySections(current, promptBudget, tokenizerModel)
+	// Chunk on file/section boundaries (the map stage joins sections with blank lines).
+	// Chunk input is capped well below promptBudget: huge chunks mean minutes of prompt
+	// evaluation per call on local inference servers, which is what used to blow the
+	// request timeout and fail every chunk.
+	chunkInputTarget := min(promptBudget, maxChunkInTokens)
+	chunks := chunkBySections(current, chunkInputTarget, tokenizerModel)
 
-	// Per-chunk OUTPUT budget is a true fraction of the total budget, independent of and
-	// smaller than each chunk's input size, so the combined output approaches promptBudget.
+	// Per-chunk OUTPUT budget is a fraction of the total budget, capped so a single chunk
+	// never asks for tens of thousands of generated tokens (at ~50 tok/s locally that is
+	// many minutes per chunk). A compact summary serves the commit message just as well.
 	perChunkOut := promptBudget / len(chunks)
+	if perChunkOut > maxChunkOutTokens {
+		perChunkOut = maxChunkOutTokens
+	}
 	if perChunkOut < minChunkOutTokens {
 		perChunkOut = minChunkOutTokens
 	}
@@ -458,14 +502,14 @@ func reduceSummarize(cfg *config.Config, current string, promptBudget int, depth
 Summarize this chunk while PRESERVING:
 - All file paths (attribution must be clear which summary belongs to which file)
 - All function/method names that changed
-- Any BREAKING CHANGE markers
+- BREAKING CHANGE markers, but ONLY if they literally appear in the input - never label a change as breaking yourself
 - The overall purpose of each change
 
 You MUST compress aggressively. Target maximum length: %d tokens.`, perChunkOut)
 
 			userPrompt := fmt.Sprintf("Summarize this chunk of diff summaries:\n\n%s", chunk)
 
-			summary, err := callLLMWithRetry(cfg, systemPrompt, userPrompt, 1)
+			summary, err := callLLMWithRetry(withMaxTokens(cfg, perChunkOut*genHeadroomFactor), systemPrompt, userPrompt, reduceRetries)
 			if err != nil {
 				// Don't abort the whole reduce on one flaky call - keep the original
 				// chunk so its file paths and content survive into the next round.
