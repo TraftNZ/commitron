@@ -121,6 +121,40 @@ func TestHierarchicalSummarize_ConvergesAndPreservesPaths(t *testing.T) {
 	}
 }
 
+func TestHierarchicalSummarize_NearBudgetOverageSummarizesMinimalFiles(t *testing.T) {
+	var calls int32
+	withFakeLLM(t, func(_ *config.Config, _, user string) (string, error) {
+		atomic.AddInt32(&calls, 1)
+		if !strings.Contains(user, "module_") {
+			t.Errorf("expected file diff in summarization prompt")
+		}
+		return "pkg/feature/module_summary.go: summarized large change", nil
+	})
+
+	cfg := testConfig()
+	diff := makeLargeDiff(26, 40)
+	inputTokens := tokenizer.CountTokens(diff, "gpt-4")
+	budget := inputTokens - 500
+	if budget <= 0 {
+		t.Fatalf("test setup invalid: budget %d", budget)
+	}
+
+	out, err := HierarchicalSummarize(cfg, diff, budget)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	if c := atomic.LoadInt32(&calls); c >= 26 {
+		t.Fatalf("expected selective summarization, got %d LLM calls", c)
+	}
+	if c := atomic.LoadInt32(&calls); c == 0 {
+		t.Fatalf("expected at least one LLM call for over-budget input")
+	}
+	if finalTokens := tokenizer.CountTokens(out, "gpt-4"); finalTokens > budget {
+		t.Fatalf("final tokens %d exceed budget %d", finalTokens, budget)
+	}
+}
+
 func TestReduceSummarize_ShrinksRoundOverRound(t *testing.T) {
 	withFakeLLM(t, keepRatioCompressor(0.4))
 

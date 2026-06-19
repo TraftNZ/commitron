@@ -14,12 +14,13 @@ import (
 
 // Configuration constants - all internal, no exported config fields
 const (
-	maxDepth          = 4   // Maximum summarization rounds
-	minPerFileTokens  = 80  // Minimum tokens per file summary
-	maxPerFileTokens  = 600 // Maximum tokens per file summary
-	concurrencyLimit  = 12  // Maximum concurrent LLM calls for per-file summarization
-	minChunkOutTokens = 120 // Minimum output token budget for a single reduce chunk
-	lastResortOverage = 10  // Allow up to 10% overage before failing
+	maxDepth                    = 4   // Maximum summarization rounds
+	minPerFileTokens            = 80  // Minimum tokens per file summary
+	maxPerFileTokens            = 600 // Maximum tokens per file summary
+	concurrencyLimit            = 12  // Maximum concurrent LLM calls for per-file summarization
+	minChunkOutTokens           = 120 // Minimum output token budget for a single reduce chunk
+	lastResortOverage           = 10  // Allow up to 10% overage before failing
+	summarizationSavingsPadding = 200 // Extra expected savings to avoid a reduce pass after map summarization
 )
 
 // fileClassification categorizes a file for handling
@@ -41,6 +42,8 @@ type processedFile struct {
 	Content        string // Summary or stub or raw content
 	Tokens         int
 	Priority       int
+	Added          int
+	Removed        int
 }
 
 // HierarchicalSummarize performs hierarchical map-reduce summarization on a diff that fits within token budget.
@@ -75,8 +78,8 @@ func HierarchicalSummarize(cfg *config.Config, diff string, promptBudget int) (s
 	}
 
 	// Step 2: Classify each file and create deterministic stubs where appropriate
-	var classifiedFiles []processedFile
-	var normalFiles []*processedFile
+	classifiedFiles := make([]processedFile, 0, len(fileDiffs))
+	var normalFileIndexes []int
 
 	totalPriority := 0
 	for _, fd := range fileDiffs {
@@ -85,6 +88,8 @@ func HierarchicalSummarize(cfg *config.Config, diff string, promptBudget int) (s
 			Path:           fd.Path,
 			Classification: class,
 			Priority:       calculateFilePriority(fd),
+			Added:          fd.Added,
+			Removed:        fd.Removed,
 		}
 
 		// Generate stub for non-normal files
@@ -107,55 +112,49 @@ func HierarchicalSummarize(cfg *config.Config, diff string, promptBudget int) (s
 			pf.Content = fmt.Sprintf("%s: no content change", fd.Path)
 		default: // classNormal
 			pf.Content = fd.Content
-			normalFiles = append(normalFiles, &pf)
 			totalPriority += pf.Priority
 		}
 
 		pf.Tokens = tokenizer.CountTokens(pf.Content, tokenizerModel)
 		classifiedFiles = append(classifiedFiles, pf)
+		if class == classNormal {
+			normalFileIndexes = append(normalFileIndexes, len(classifiedFiles)-1)
+		}
 	}
 
 	debugPrint(cfg, "HIERARCHICAL CLASSIFICATION", map[string]any{
 		"total_files":   len(classifiedFiles),
-		"needs_summary": len(normalFiles),
+		"needs_summary": len(normalFileIndexes),
 	})
 
-	// Step 3: Map - per-file summarization for normal files that exceed budget
-	if len(normalFiles) > 0 {
-		// Allocate budgets based on priority
-		allocateBudgets(normalFiles, promptBudget, totalPriority)
+	currentTokens := combinedTokenCount(classifiedFiles, tokenizerModel)
 
-		// Count how many files need summarization
-		needSummarize := 0
-		for _, pf := range normalFiles {
-			if pf.Tokens > allocateBudgetForFile(pf.Priority, totalPriority, promptBudget, minPerFileTokens, maxPerFileTokens) {
-				needSummarize++
-			}
+	// Classification alone can bring the diff under budget by stubbing generated,
+	// binary, rename-only, or whitespace-only files.
+	if currentTokens <= promptBudget {
+		return combineProcessedFiles(classifiedFiles), nil
+	}
+
+	// Step 3: Map - summarize only enough normal files to cover the actual overage.
+	if len(normalFileIndexes) > 0 {
+		summarizeIndexes := selectFilesForMapSummarization(classifiedFiles, normalFileIndexes, promptBudget, currentTokens)
+
+		if len(summarizeIndexes) > 0 {
+			fmt.Printf("\033[1;36m🔄 Summarizing %d large files (%d concurrent)...\033[0m\n", len(summarizeIndexes), concurrencyLimit)
 		}
 
-		if needSummarize > 0 {
-			fmt.Printf("\033[1;36m🔄 Summarizing %d large files (%d concurrent)...\033[0m\n", needSummarize, concurrencyLimit)
-		}
-
-		// Run concurrent summarization with limit 4
 		var g errgroup.Group
 		g.SetLimit(concurrencyLimit)
 
-		for _, pf := range normalFiles {
-			pf := pf // capture loop variable
-			budget := allocateBudgetForFile(pf.Priority, totalPriority, promptBudget, minPerFileTokens, maxPerFileTokens)
-			if pf.Tokens <= budget {
-				// Already fits, skip summarization
-				continue
-			}
+		for _, idx := range summarizeIndexes {
+			idx := idx
 			g.Go(func() error {
+				pf := &classifiedFiles[idx]
 				summary, err := summarizeSingleFile(cfg, pf.Path, pf.Content, maxPerFileTokens)
 				if err != nil {
 					// On failure, fall back to deterministic stub
 					debugPrint(cfg, "PER-FILE SUMMARY FAILED", fmt.Sprintf("%s: %v, using stub", pf.Path, err))
-					summary = fmt.Sprintf("%s: +%d/-%d lines (summary failed)", pf.Path,
-						fileDiffs[findFileDiffIndex(pf.Path, fileDiffs)].Added,
-						fileDiffs[findFileDiffIndex(pf.Path, fileDiffs)].Removed)
+					summary = fmt.Sprintf("%s: +%d/-%d lines (summary failed)", pf.Path, pf.Added, pf.Removed)
 				}
 				pf.Content = summary
 				pf.Tokens = tokenizer.CountTokens(summary, tokenizerModel)
@@ -168,13 +167,8 @@ func HierarchicalSummarize(cfg *config.Config, diff string, promptBudget int) (s
 	}
 
 	// Step 4: Combine all processed content and check if fits
-	var combined strings.Builder
-	for _, pf := range classifiedFiles {
-		combined.WriteString(pf.Content)
-		combined.WriteString("\n\n")
-	}
-	current := strings.TrimSpace(combined.String())
-	currentTokens := tokenizer.CountTokens(current, tokenizerModel)
+	current := combineProcessedFiles(classifiedFiles)
+	currentTokens = tokenizer.CountTokens(current, tokenizerModel)
 
 	debugPrint(cfg, "AFTER MAP STAGE", map[string]any{
 		"tokens_after_map": currentTokens,
@@ -339,28 +333,67 @@ func extractRenamePaths(content string) (oldPath, newPath string) {
 	return
 }
 
-// allocateBudgets assigns per-file token budgets based on priority
-func allocateBudgets(files []*processedFile, totalBudget int, totalPriority int) {
+func combineProcessedFiles(files []processedFile) string {
+	var combined strings.Builder
 	for _, pf := range files {
-		_ = allocateBudgetForFile(pf.Priority, totalPriority, totalBudget, minPerFileTokens, maxPerFileTokens)
-		// We just calculate it - actual usage happens during summarization
-		// Store budget somewhere if needed, but we don't need to keep it after allocation
-		// pf.Tokens is already calculated from when pf was created
+		combined.WriteString(pf.Content)
+		combined.WriteString("\n\n")
 	}
+	return strings.TrimSpace(combined.String())
 }
 
-func allocateBudgetForFile(priority, totalPriority, totalBudget int, minTok, maxTok int) int {
-	if totalPriority == 0 {
-		return (minTok + maxTok) / 2
+func combinedTokenCount(files []processedFile, tokenizerModel string) int {
+	if len(files) == 0 {
+		return 0
 	}
-	budget := float64(totalBudget) * float64(priority) / float64(totalPriority)
-	if budget < float64(minTok) {
-		return minTok
+
+	total := 0
+	separatorTokens := tokenizer.CountTokens("\n\n", tokenizerModel)
+	for i, pf := range files {
+		total += pf.Tokens
+		if i < len(files)-1 {
+			total += separatorTokens
+		}
 	}
-	if budget > float64(maxTok) {
-		return maxTok
+	return total
+}
+
+func selectFilesForMapSummarization(files []processedFile, normalIndexes []int, promptBudget, currentTokens int) []int {
+	if currentTokens <= promptBudget {
+		return nil
 	}
-	return int(budget)
+
+	targetSavings := currentTokens - promptBudget + summarizationSavingsPadding
+	candidates := make([]int, 0, len(normalIndexes))
+	for _, idx := range normalIndexes {
+		if files[idx].Tokens > minPerFileTokens {
+			candidates = append(candidates, idx)
+		}
+	}
+
+	sort.Slice(candidates, func(i, j int) bool {
+		left := files[candidates[i]]
+		right := files[candidates[j]]
+		if left.Tokens != right.Tokens {
+			return left.Tokens > right.Tokens
+		}
+		if left.Priority != right.Priority {
+			return left.Priority < right.Priority
+		}
+		return left.Path < right.Path
+	})
+
+	selected := make([]int, 0, len(candidates))
+	expectedSavings := 0
+	for _, idx := range candidates {
+		selected = append(selected, idx)
+		expectedSavings += files[idx].Tokens - minPerFileTokens
+		if expectedSavings >= targetSavings {
+			break
+		}
+	}
+
+	return selected
 }
 
 // summarizeSingleFile summarizes a single file's diff using LLM
@@ -528,46 +561,51 @@ func lastResortSortAndFit(files []processedFile, promptBudget int, tokenizerMode
 		return files[i].Priority > files[j].Priority
 	})
 
-	var result strings.Builder
-	currentTokens := 0
+	sections := make([]string, len(files))
+	for i, pf := range files {
+		sections[i] = makeStubForLastResort(pf)
+	}
+	currentTokens := tokenizer.CountTokens(strings.TrimSpace(strings.Join(sections, "\n\n")), tokenizerModel)
 
-	// Add files starting from highest priority, stop when we hit budget
-	for _, pf := range files {
-		content := pf.Content
-		toks := tokenizer.CountTokens(content, tokenizerModel)
-		if currentTokens+toks <= promptBudget {
-			result.WriteString(content)
-			result.WriteString("\n\n")
-			currentTokens += toks
-		} else {
-			// Add stub at least to guarantee path appears
-			stub := makeStubForLastResort(pf)
-			stubToks := tokenizer.CountTokens(stub, tokenizerModel)
-			if currentTokens+stubToks <= promptBudget {
-				result.WriteString(stub)
-				result.WriteString("\n\n")
-				currentTokens += stubToks
-			}
-			// Even if stub doesn't fit, stop - higher priority files are already in
+	if currentTokens > promptBudget {
+		return compactPathList(files, promptBudget, tokenizerModel)
+	}
+
+	// Upgrade highest-priority stubs to full content while preserving room for every
+	// remaining file stub.
+	for i, pf := range files {
+		candidateSections := append([]string(nil), sections...)
+		candidateSections[i] = pf.Content
+		candidate := strings.TrimSpace(strings.Join(candidateSections, "\n\n"))
+		candidateTokens := tokenizer.CountTokens(candidate, tokenizerModel)
+		if candidateTokens <= promptBudget {
+			sections = candidateSections
+			currentTokens = candidateTokens
 		}
 	}
 
-	return strings.TrimSpace(result.String())
+	return strings.TrimSpace(strings.Join(sections, "\n\n"))
 }
 
 func makeStubForLastResort(pf processedFile) string {
-	// Extract line counts from original diff if available - we don't store them,
-	// but path is all we really need at minimum
-	return fmt.Sprintf("%s: summary omitted due to size constraints", pf.Path)
+	return fmt.Sprintf("%s: omitted due to size constraints", pf.Path)
 }
 
-func findFileDiffIndex(path string, fileDiffs []FileDiff) int {
-	for i, fd := range fileDiffs {
-		if fd.Path == path {
-			return i
-		}
+func compactPathList(files []processedFile, promptBudget int, tokenizerModel string) string {
+	paths := make([]string, 0, len(files))
+	for _, pf := range files {
+		paths = append(paths, pf.Path)
 	}
-	return 0
+
+	for len(paths) > 0 {
+		out := "Files changed: " + strings.Join(paths, ", ")
+		if tokenizer.CountTokens(out, tokenizerModel) <= promptBudget {
+			return out
+		}
+		paths = paths[:len(paths)-1]
+	}
+
+	return ""
 }
 
 // extractHunkEnclosingFunc extracts the function/method name from a hunk header
