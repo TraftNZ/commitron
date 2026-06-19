@@ -38,15 +38,16 @@ const (
 type Config struct {
 	// AI provider configuration
 	AI struct {
-		Provider       AIProvider `yaml:"provider"`
-		APIKey         string     `yaml:"api_key"`
-		Model          string     `yaml:"model"`
-		OllamaHost     string     `yaml:"ollama_host,omitempty"`
-		OpenAIEndpoint string     `yaml:"openai_endpoint,omitempty"` // Custom OpenAI API endpoint
-		Temperature    float64    `yaml:"temperature"`
-		SystemPrompt   string     `yaml:"system_prompt"`
-		Debug          bool       `yaml:"debug,omitempty"`      // When true, prints debug info about AI requests
-		MaxTokens      int        `yaml:"max_tokens,omitempty"` // Maximum tokens to generate in response
+		Provider              AIProvider `yaml:"provider"`
+		APIKey                string     `yaml:"api_key"`
+		Model                 string     `yaml:"model"`
+		OllamaHost            string     `yaml:"ollama_host,omitempty"`
+		OpenAIEndpoint        string     `yaml:"openai_endpoint,omitempty"` // Custom OpenAI API endpoint
+		Temperature           float64    `yaml:"temperature"`
+		SystemPrompt          string     `yaml:"system_prompt"`
+		Debug                 bool       `yaml:"debug,omitempty"`                   // When true, prints debug info about AI requests
+		MaxTokens             int        `yaml:"max_tokens,omitempty"`              // Maximum tokens to generate in response
+		RequestTimeoutSeconds int        `yaml:"request_timeout_seconds,omitempty"` // HTTP request timeout for AI provider calls
 	} `yaml:"ai"`
 
 	// Commit message configuration
@@ -92,6 +93,7 @@ func DefaultConfig() *Config {
 	cfg.AI.SystemPrompt = ""
 	cfg.AI.Debug = false
 	cfg.AI.MaxTokens = 8000
+	cfg.AI.RequestTimeoutSeconds = 300
 
 	// Default commit settings
 	cfg.Commit.Convention = NoConvention
@@ -106,9 +108,9 @@ func DefaultConfig() *Config {
 	cfg.Context.IncludeFileSummaries = false
 	cfg.Context.ShowFirstLinesOfFile = 0
 	cfg.Context.IncludeRepoStructure = false
-	cfg.Context.MaxInputTokens = 100000          // 100K tokens (safe under most model limits)
-	cfg.Context.DiffStrategy = "auto"            // Auto-select strategy based on size
-	cfg.Context.TokenizerModel = ""              // Empty = use cfg.AI.Model
+	cfg.Context.MaxInputTokens = 100000 // 100K tokens (safe under most model limits)
+	cfg.Context.DiffStrategy = "auto"   // Auto-select strategy based on size
+	cfg.Context.TokenizerModel = ""     // Empty = use cfg.AI.Model
 	cfg.Context.SummarizationEnabled = true
 
 	// Default UI settings
@@ -179,9 +181,10 @@ func SaveExampleConfig(path string) error {
 	cfg.AI.Provider = OpenAI
 	cfg.AI.APIKey = "your-api-key-here"
 	cfg.AI.Model = "gpt-3.5-turbo"
-	cfg.AI.Temperature = 0.7 // Example temperature value
-	cfg.AI.Debug = false     // Set to true to see AI prompts and responses
-	cfg.AI.MaxTokens = 8000  // Maximum response tokens
+	cfg.AI.Temperature = 0.7           // Example temperature value
+	cfg.AI.Debug = false               // Set to true to see AI prompts and responses
+	cfg.AI.MaxTokens = 8000            // Maximum response tokens
+	cfg.AI.RequestTimeoutSeconds = 300 // HTTP request timeout in seconds
 
 	// Example of a custom system prompt (commented out by default)
 	cfg.AI.SystemPrompt = "# Custom system prompt (uncomment to use)\n# You are an expert developer who writes clear, concise commit messages.\n# Always follow the conventional commits format and be specific."

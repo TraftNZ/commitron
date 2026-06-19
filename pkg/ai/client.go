@@ -14,11 +14,19 @@ import (
 	"github.com/johnstilia/commitron/pkg/config"
 )
 
-// httpClient is shared across all provider calls. A bounded timeout prevents a single
-// stalled connection from hanging the whole run indefinitely - the dominant failure mode
-// when summarizing large diffs across many concurrent requests.
-var httpClient = &http.Client{
-	Timeout: 120 * time.Second,
+const defaultRequestTimeoutSeconds = 300
+
+// httpClientForConfig returns a bounded client for provider calls. The default is
+// intentionally higher than local/relay model cold paths observed on large diffs.
+func httpClientForConfig(cfg *config.Config) *http.Client {
+	timeoutSeconds := cfg.AI.RequestTimeoutSeconds
+	if timeoutSeconds <= 0 {
+		timeoutSeconds = defaultRequestTimeoutSeconds
+	}
+
+	return &http.Client{
+		Timeout: time.Duration(timeoutSeconds) * time.Second,
+	}
 }
 
 // CallLLM calls the configured AI provider with the given system and user prompts.
@@ -118,7 +126,7 @@ func callOpenAI(cfg *config.Config, systemPrompt, userPrompt string, stream bool
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Authorization", "Bearer "+cfg.AI.APIKey)
 
-	resp, err := httpClient.Do(req)
+	resp, err := httpClientForConfig(cfg).Do(req)
 	if err != nil {
 		return "", err
 	}
@@ -286,7 +294,7 @@ func callGemini(cfg *config.Config, systemPrompt, userPrompt string) (string, er
 
 	req.Header.Set("Content-Type", "application/json")
 
-	resp, err := httpClient.Do(req)
+	resp, err := httpClientForConfig(cfg).Do(req)
 	if err != nil {
 		return "", err
 	}
@@ -364,7 +372,7 @@ func callOllama(cfg *config.Config, systemPrompt, userPrompt string, stream bool
 
 	req.Header.Set("Content-Type", "application/json")
 
-	resp, err := httpClient.Do(req)
+	resp, err := httpClientForConfig(cfg).Do(req)
 	if err != nil {
 		return "", err
 	}
@@ -485,7 +493,7 @@ func callClaude(cfg *config.Config, systemPrompt, userPrompt string) (string, er
 	req.Header.Set("X-API-Key", cfg.AI.APIKey)
 	req.Header.Set("Anthropic-Version", "2023-06-01")
 
-	resp, err := httpClient.Do(req)
+	resp, err := httpClientForConfig(cfg).Do(req)
 	if err != nil {
 		return "", err
 	}

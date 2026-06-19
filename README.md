@@ -90,6 +90,7 @@ ai:
   model: gpt-4o                 # Model name for your provider
   temperature: 0.7
   max_tokens: 1000
+  request_timeout_seconds: 300  # Increase for slow local/proxy models
 
 # Commit message settings
 commit:
@@ -335,6 +336,11 @@ If you see "No staged files found" but have changes:
 - Verify endpoint URL is correct
 - Ensure endpoint is OpenAI-compatible
 - Check network connectivity
+
+**Request timeout exceeded:**
+- Increase `ai.request_timeout_seconds` in `~/.commitronrc`
+- Reduce `context.max_input_tokens` for very large diffs
+- Reduce `ai.max_tokens` if the endpoint spends too long generating
 
 ### Debug Mode
 
