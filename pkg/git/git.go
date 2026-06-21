@@ -8,6 +8,13 @@ import (
 	"strings"
 )
 
+// diffContextArg controls how many unchanged context lines surround each hunk in
+// the staged diff. "-U0" keeps every added/removed line plus the hunk headers
+// (which carry the enclosing function names) while dropping unchanged surrounding
+// lines, cutting prompt size — and thus model prefill latency — with no loss of
+// changed content.
+const diffContextArg = "-U0"
+
 // IsGitRepo checks if the current directory is a git repository
 func IsGitRepo() bool {
 	cmd := exec.Command("git", "rev-parse", "--is-inside-work-tree")
@@ -39,7 +46,7 @@ func GetStagedFiles() ([]string, error) {
 
 // GetStagedChanges returns the diff of staged changes
 func GetStagedChanges() (string, error) {
-	cmd := exec.Command("git", "diff", "--cached")
+	cmd := exec.Command("git", "diff", "--cached", diffContextArg)
 	var out bytes.Buffer
 	cmd.Stdout = &out
 	err := cmd.Run()

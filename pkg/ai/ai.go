@@ -632,7 +632,6 @@ func parseTextCommitMessage(text string) CommitMessage {
 	if msg.Body != "" {
 		// Remove placeholder text if it appears to be template text
 		if strings.Contains(strings.ToLower(msg.Body), "<descriptive body") ||
-			strings.Contains(strings.ToLower(msg.Body), "explanat") ||
 			strings.Contains(strings.ToLower(msg.Body), "<commit message>") ||
 			strings.Contains(strings.ToLower(msg.Body), "<optional body>") {
 			msg.Body = ""
@@ -843,10 +842,17 @@ func DisplayAnalysisComplete() {
 	fmt.Println("\033[1;32m✓ Analysis complete\033[0m")
 }
 
+// diffContextArg controls how many unchanged context lines surround each hunk in
+// the staged diff sent to the model. "-U0" keeps every added/removed line plus the
+// hunk headers (which carry the enclosing function names) while dropping unchanged
+// surrounding lines, substantially cutting prompt size — and thus model prefill
+// latency — with no loss of changed content.
+const diffContextArg = "-U0"
+
 // GetGitDiff returns clean git diff output for the staged files
 func GetGitDiff(files []string) (string, error) {
 	// Get clean git diff output without extra headers
-	cmd := exec.Command("git", "diff", "--staged")
+	cmd := exec.Command("git", "diff", "--staged", diffContextArg)
 	diffOutput, err := cmd.Output()
 	if err != nil {
 		return "", fmt.Errorf("error getting git diff: %w", err)
@@ -1853,7 +1859,6 @@ func validateConventionalCommit(msg CommitMessage, cfg *config.Config) error {
 		// Check if body is just placeholder text
 		if strings.Contains(strings.ToLower(trimmedBody), "<descriptive body") ||
 			strings.Contains(strings.ToLower(trimmedBody), "<optional body>") ||
-			strings.Contains(strings.ToLower(trimmedBody), "explanat") ||
 			strings.Contains(strings.ToLower(trimmedBody), "<commit message>") {
 			return fmt.Errorf("commit body contains placeholder text and needs to be replaced with actual content")
 		}
