@@ -68,23 +68,25 @@ context:
   # Ollama: depends on model, typically 8,000
   max_input_tokens: 100000
 
-  # Strategy for handling large diffs that exceed token limits
-  # All options now use hierarchical summarization:
-  #   - "auto" (recommended): Recursive map-reduce summarization that never truncates silently
-  #   - "summarize", "batch": Now aliases to auto - all use hierarchical summarization
-  #   - "truncate": deprecated, now alias to auto - silent truncation is no longer used
-  # Every file always appears in the prompt at least as a stub (path + change counts)
-  diff_strategy: auto
+  # Maximum tokens of diff text sent to the model (leave unset for 12000)
+  # This is the setting that governs speed: prompt evaluation dominates the wall
+  # time of a request, and it scales directly with the size of the diff.
+  # The diff is reduced deterministically - no extra model calls - by dropping
+  # context lines and diff plumbing, stubbing generated/lockfile/binary files, and
+  # only then eliding changed lines with an explicit "... N of M lines elided" marker.
+  # Every file and every enclosing symbol always survives, so nothing vanishes silently.
+  # Lower it (e.g. 6000) for faster commits, raise it for more detailed bodies.
+  # max_diff_tokens: 12000
 
-  # NEW: Model to use for token counting (leave empty to use ai.model)
+  # Number of recent commit subjects shown to the model as style reference
+  # This teaches the model your repository's own conventions (scope vocabulary,
+  # phrasing, level of detail) far more cheaply than abstract style rules.
+  # Set to 0 to disable.
+  include_recent_commits: 10
+
+  # Model to use for token counting (leave empty to use ai.model)
   # Only set this if you want different tokenization than your AI model
   # tokenizer_model: ""
-
-  # NEW: Enable smart diff summarization
-  # When true, uses priority-based summarization for large diffs
-  # High-priority files (core logic) get full context
-  # Low-priority files (tests, docs) get summaries
-  summarization_enabled: true
 
   # Include statistics about file changes (+/- lines)
   # Helps AI understand the magnitude and type of changes

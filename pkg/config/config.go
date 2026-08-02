@@ -1,7 +1,6 @@
 package config
 
 import (
-	"fmt"
 	"os"
 	"path/filepath"
 
@@ -68,9 +67,9 @@ type Config struct {
 		ShowFirstLinesOfFile int    `yaml:"show_first_lines_of_file,omitempty"` // Show first N lines of each file for better context
 		IncludeRepoStructure bool   `yaml:"include_repo_structure,omitempty"`   // Include high-level repo structure
 		MaxInputTokens       int    `yaml:"max_input_tokens,omitempty"`         // Maximum tokens for input context (replaces MaxContextLength)
-		DiffStrategy         string `yaml:"diff_strategy,omitempty"`            // Strategy for handling large diffs: "auto", "summarize", "batch", "truncate"
+		MaxDiffTokens        int    `yaml:"max_diff_tokens,omitempty"`          // Maximum tokens of diff text sent to the model (bounds prompt-eval latency)
+		IncludeRecentCommits int    `yaml:"include_recent_commits,omitempty"`   // Number of recent commit subjects shown to the model for style matching
 		TokenizerModel       string `yaml:"tokenizer_model,omitempty"`          // Model to use for token counting (empty = use AI model)
-		SummarizationEnabled bool   `yaml:"summarization_enabled,omitempty"`    // Enable smart diff summarization
 	} `yaml:"context"`
 
 	// User interface configuration
@@ -108,10 +107,10 @@ func DefaultConfig() *Config {
 	cfg.Context.IncludeFileSummaries = false
 	cfg.Context.ShowFirstLinesOfFile = 0
 	cfg.Context.IncludeRepoStructure = false
-	cfg.Context.MaxInputTokens = 100000 // 100K tokens (safe under most model limits)
-	cfg.Context.DiffStrategy = "auto"   // Auto-select strategy based on size
-	cfg.Context.TokenizerModel = ""     // Empty = use cfg.AI.Model
-	cfg.Context.SummarizationEnabled = true
+	cfg.Context.MaxInputTokens = 100000   // 100K tokens (safe under most model limits)
+	cfg.Context.MaxDiffTokens = 0         // 0 = use defaultMaxDiffTokens
+	cfg.Context.IncludeRecentCommits = 10 // Recent commit subjects shown for style matching
+	cfg.Context.TokenizerModel = ""       // Empty = use cfg.AI.Model
 
 	// Default UI settings
 	cfg.UI.EnableTUI = true
@@ -129,13 +128,6 @@ func ParseConfig(data []byte) (*Config, error) {
 	err := yaml.Unmarshal(data, cfg)
 	if err != nil {
 		return nil, err
-	}
-
-	// Normalize diff strategy: "truncate" is deprecated - now an alias for auto/hierarchical
-	if cfg.Context.DiffStrategy == "truncate" {
-		// Emit one-time warning to stderr
-		fmt.Fprintf(os.Stderr, "warning: diff_strategy: 'truncate' is deprecated and will be ignored - hierarchical summarization is used for all strategies\n")
-		cfg.Context.DiffStrategy = "auto"
 	}
 
 	return cfg, nil

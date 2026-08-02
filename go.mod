@@ -5,7 +5,6 @@ go 1.25.0
 require (
 	github.com/pkoukk/tiktoken-go v0.1.6
 	github.com/spf13/cobra v1.9.1
-	golang.org/x/sync v0.20.0
 	gopkg.in/yaml.v3 v3.0.1
 )
 

@@ -103,9 +103,9 @@ commit:
 context:
   include_file_names: true
   include_diff: true
-  max_input_tokens: 100000     # Token limit (100K for OpenAI)
-  diff_strategy: auto          # auto, summarize, batch, truncate
-  summarization_enabled: true
+  max_input_tokens: 100000     # Context window limit (100K for OpenAI)
+  max_diff_tokens: 12000       # Diff text sent to the model - the main speed knob
+  include_recent_commits: 10   # Recent subjects shown as style reference
 
 # UI settings
 ui:
@@ -262,19 +262,28 @@ ai:
   debug: true
 ```
 
-### Diff Processing Strategies
+### Diff Compaction
 
-Configure how large diffs are handled:
+Large diffs are reduced deterministically before they reach the model — no extra
+model calls, so a big commit costs one request just like a small one:
 
 ```yaml
 context:
-  diff_strategy: auto  # Options: auto, summarize, batch, truncate
+  max_diff_tokens: 12000  # Diff budget; lower is faster, higher is more detailed
 ```
 
-- **auto**: Automatically selects strategy based on size (recommended)
-- **summarize**: Priority-based summarization preserving key changes
-- **batch**: Processes very large diffs in batches (200K+ tokens)
-- **truncate**: Simple truncation at token boundary
+Compaction happens in order, stopping as soon as the diff fits:
+
+1. Drop diff plumbing (`index`, `---`/`+++`, mode and rename lines) and unchanged
+   context lines — the model only needs to see what changed.
+2. Stub generated files, lockfiles and binaries as a one-line note.
+3. Elide the remaining changed lines, budget spread fairly across files so one huge
+   file cannot starve the rest, with an explicit `... N of M changed lines elided`
+   marker so the model knows its view is partial.
+
+Every file path and every enclosing symbol always survives, so nothing disappears
+silently. Because prompt evaluation dominates request latency, `max_diff_tokens` is
+the single most effective setting for commit speed.
 
 ### Token Limits by Provider
 
@@ -298,12 +307,12 @@ context:
 If you get "maximum context length exceeded" errors:
 
 1. **Split commits**: Break changes into smaller logical chunks
-2. **Use batch strategy**:
+2. **Reduce the diff budget**:
    ```yaml
    context:
-     diff_strategy: batch
+     max_diff_tokens: 6000
    ```
-3. **Reduce token limit**:
+3. **Reduce the context limit**:
    ```yaml
    context:
      max_input_tokens: 50000
@@ -339,7 +348,7 @@ If you see "No staged files found" but have changes:
 
 **Request timeout exceeded:**
 - Increase `ai.request_timeout_seconds` in `~/.commitronrc`
-- Reduce `context.max_input_tokens` for very large diffs
+- Reduce `context.max_diff_tokens` — prompt evaluation is usually the slow part
 - Reduce `ai.max_tokens` if the endpoint spends too long generating
 
 ### Debug Mode

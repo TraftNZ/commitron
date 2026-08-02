@@ -2,9 +2,42 @@ package tokenizer
 
 import (
 	"strings"
+	"sync"
 
 	"github.com/pkoukk/tiktoken-go"
 )
+
+// tiktoken caches the parsed BPE rank tables but rebuilds the encoder itself on every
+// EncodingForModel/GetEncoding call, and that rebuild walks the full ~100K-entry
+// vocabulary. Counting tokens line by line (as diff compaction and truncation do)
+// therefore costs O(lines x vocab) unless the encoder is cached here.
+var (
+	encoderMu    sync.Mutex
+	encoderCache = map[string]*tiktoken.Tiktoken{}
+)
+
+// encoderFor returns a cached encoder for the model, falling back to cl100k_base for
+// unknown models. It returns nil when no encoding can be built at all.
+func encoderFor(model string) *tiktoken.Tiktoken {
+	encoderMu.Lock()
+	defer encoderMu.Unlock()
+
+	if enc, ok := encoderCache[model]; ok {
+		return enc
+	}
+
+	enc, err := tiktoken.EncodingForModel(model)
+	if err != nil {
+		// Fallback to cl100k_base for unknown models (local models, future models)
+		enc, err = tiktoken.GetEncoding("cl100k_base")
+		if err != nil {
+			enc = nil
+		}
+	}
+
+	encoderCache[model] = enc
+	return enc
+}
 
 // CountTokens returns the number of tokens in the given text for the specified model.
 // For unknown models, it falls back to cl100k_base encoding (current OpenAI standard).
@@ -13,20 +46,14 @@ func CountTokens(text string, model string) int {
 		return 0
 	}
 
-	// Try to get encoding for the specific model
-	encoding, err := tiktoken.EncodingForModel(model)
-	if err != nil {
-		// Fallback to cl100k_base for unknown models (gpt-4, gpt-3.5-turbo, future models)
-		encoding, err = tiktoken.GetEncoding("cl100k_base")
-		if err != nil {
-			// Ultimate fallback: estimate based on character count
-			// Typical ratio is 1 token ≈ 3.5 characters for English text
-			return int(float64(len(text)) / 3.5)
-		}
+	encoding := encoderFor(model)
+	if encoding == nil {
+		// Ultimate fallback: estimate based on character count
+		// Typical ratio is 1 token ≈ 3.5 characters for English text
+		return int(float64(len(text)) / 3.5)
 	}
 
-	tokens := encoding.Encode(text, nil, nil)
-	return len(tokens)
+	return len(encoding.Encode(text, nil, nil))
 }
 
 // TruncateToTokenLimit intelligently truncates text to fit within the token limit.

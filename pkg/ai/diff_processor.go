@@ -3,11 +3,7 @@ package ai
 import (
 	"fmt"
 	"regexp"
-	"sort"
 	"strings"
-
-	"github.com/johnstilia/commitron/pkg/config"
-	"github.com/johnstilia/commitron/pkg/tokenizer"
 )
 
 // FileDiff represents a single file's diff information
@@ -18,13 +14,6 @@ type FileDiff struct {
 	Removed int    // Lines removed
 	Content string // Raw diff content for this file
 	Summary string // Generated summary
-}
-
-// FileWithPriority represents a file with its priority score and token count
-type FileWithPriority struct {
-	FileDiff
-	Priority int // Priority score (0-200+)
-	Tokens   int // Token count for this file's diff
 }
 
 // ParseDiffByFile splits a git diff into per-file chunks
@@ -161,11 +150,11 @@ func extractFunctionNames(diff string) []string {
 
 	// Patterns for different languages (capture group for function name)
 	patterns := []*regexp.Regexp{
-		regexp.MustCompile(`^[+-].*func\s+(\w+)`),                          // Go functions
-		regexp.MustCompile(`^[+-].*function\s+(\w+)`),                      // JavaScript functions
-		regexp.MustCompile(`^[+-].*def\s+(\w+)`),                           // Python functions
-		regexp.MustCompile(`^[+-].*class\s+(\w+)`),                         // Class definitions
-		regexp.MustCompile(`^[+-].*(\w+)\s*\([^)]*\)\s*{`),                 // Generic function patterns
+		regexp.MustCompile(`^[+-].*func\s+(\w+)`),                                 // Go functions
+		regexp.MustCompile(`^[+-].*function\s+(\w+)`),                             // JavaScript functions
+		regexp.MustCompile(`^[+-].*def\s+(\w+)`),                                  // Python functions
+		regexp.MustCompile(`^[+-].*class\s+(\w+)`),                                // Class definitions
+		regexp.MustCompile(`^[+-].*(\w+)\s*\([^)]*\)\s*{`),                        // Generic function patterns
 		regexp.MustCompile(`^[+-].*(?:public|private|protected)\s+\w+\s+(\w+)\(`), // Java/C++ methods
 	}
 
@@ -257,92 +246,4 @@ func extractKeyChanges(diff string, maxLines int) []string {
 	}
 
 	return changes
-}
-
-// PrioritizeFiles scores files by importance for commit message generation
-func PrioritizeFiles(files []FileDiff) []FileWithPriority {
-	var prioritized []FileWithPriority
-
-	for _, file := range files {
-		priority := calculateFilePriority(file)
-		tokens := tokenizer.CountTokens(file.Content, "gpt-4") // Use gpt-4 as baseline
-
-		prioritized = append(prioritized, FileWithPriority{
-			FileDiff: file,
-			Priority: priority,
-			Tokens:   tokens,
-		})
-	}
-
-	// Sort by priority (highest first)
-	sort.Slice(prioritized, func(i, j int) bool {
-		return prioritized[i].Priority > prioritized[j].Priority
-	})
-
-	return prioritized
-}
-
-// calculateFilePriority scores a file based on its importance
-func calculateFilePriority(file FileDiff) int {
-	score := 0
-	path := file.Path
-
-	// Core logic files get high priority
-	if strings.Contains(path, "pkg/ai/") {
-		score += 100
-	} else if strings.Contains(path, "pkg/git/") {
-		score += 80
-	} else if strings.Contains(path, "cmd/") {
-		score += 60
-	} else if strings.Contains(path, "pkg/") {
-		score += 40
-	}
-
-	// Change magnitude (capped at 50)
-	totalChanges := file.Added + file.Removed
-	score += min(totalChanges, 50)
-
-	// File type bonuses/penalties
-	if strings.HasSuffix(path, ".go") {
-		score += 30
-	} else if strings.HasSuffix(path, "_test.go") {
-		score -= 20 // Tests are lower priority
-	} else if strings.HasSuffix(path, ".md") {
-		score -= 30 // Docs are lower priority
-	} else if strings.HasSuffix(path, ".json") || strings.HasSuffix(path, ".yaml") || strings.HasSuffix(path, ".yml") {
-		score += 10 // Config files are somewhat important
-	}
-
-	// New files are interesting
-	if file.Status == "added" {
-		score += 20
-	}
-
-	// Deleted files are less interesting for future context
-	if file.Status == "deleted" {
-		score -= 30
-	}
-
-	return max(score, 0)
-}
-
-// BuildContextFromDiff intelligently builds context within token limits using hierarchical summarization
-func BuildContextFromDiff(diff string, maxTokens int, cfg *config.Config) (string, error) {
-	return HierarchicalSummarize(cfg, diff, maxTokens)
-}
-
-// min returns the minimum of two integers
-func min(a, b int) int {
-	if a < b {
-		return a
-	}
-	return b
-}
-
-// max returns the maximum of two integers
-func max(a, b int) int {
-	if a > b {
-		return a
-	}
-	return b
 }

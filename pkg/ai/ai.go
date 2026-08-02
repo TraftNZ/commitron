@@ -229,7 +229,7 @@ func FormatCommitMessage(msg CommitMessage, cfg *config.Config) string {
 	// Add body if configured and provided - format as bullet points
 	if cfg.Commit.IncludeBody && msg.Body != "" {
 		result.WriteString("\n\n")
-		
+
 		// Format body as bullet points if it's not already formatted
 		bodyLines := strings.Split(strings.TrimSpace(msg.Body), "\n")
 		for _, line := range bodyLines {
@@ -252,194 +252,184 @@ func FormatCommitMessage(msg CommitMessage, cfg *config.Config) string {
 	return result.String()
 }
 
-// GenerateTextPrompt creates a natural language prompt for commit message generation
-// This function generates a more human-readable prompt compared to the JSON template approach
+// GenerateTextPrompt creates the user message for commit message generation.
+//
+// Prompt size is latency: prompt evaluation dominates wall time on self-hosted
+// endpoints, so the instructions are stated once, precisely, instead of being
+// repeated for emphasis. Repetition also costs quality - restating the same rule in
+// six competing phrasings gives a model contradictory targets to satisfy.
 func GenerateTextPrompt(cfg *config.Config, files []string, changes string) string {
-	// Determine the commit convention type
-	conventionType := ""
+	var p []string
+
 	if cfg.Commit.Convention == config.ConventionalCommits {
-		conventionType = "conventional"
-	}
-
-	if cfg.AI.Debug {
-		debugPrint(cfg, "TEXT PROMPT CONVENTION", conventionType)
-	}
-
-	// Build the prompt with structured information
-	prompts := []string{
-		"You are a git commit message generator. Output ONLY the commit message, nothing else.",
-		"DO NOT include any explanatory text, analysis, or preamble like 'Based on the git diff provided' or 'It appears that'.",
-		"Your response should be the raw commit message that will be passed directly to git commit.",
-		"Write commit messages in present tense for the following code changes.",
-		"Keep the SUBJECT line extremely concise; the body should be a thorough bulleted breakdown of the changes.",
-		"For the subject, prefer: 'Add user auth' over 'Add a new feature for user authentication'",
-		"For the subject, prefer: 'Fix parsing bug' over 'Fix a bug in the parsing logic'",
-	}
-
-	// Add specific format requirements for conventional commits first to emphasize importance
-	if cfg.Commit.Convention == config.ConventionalCommits {
-		prompts = append(prompts, "YOUR RESPONSE MUST START WITH A CONVENTIONAL COMMIT TYPE. Valid types are: feat, fix, docs, style, refactor, perf, test, build, ci, chore, revert.")
-		prompts = append(prompts, "Format MUST BE: type(optional-scope): subject")
-		prompts = append(prompts, "Example: fix(parser): correct array parsing issue")
-		prompts = append(prompts, "DO NOT START YOUR RESPONSE WITH A COLON. The type MUST come first, followed by colon.")
-	}
-
-	prompts = append(prompts, fmt.Sprintf("CRITICAL: Commit message subject MUST NOT exceed %d characters total. YOU MUST COUNT THE CHARACTERS YOURSELF AND ENSURE THE TOTAL IS UNDER %d. This is a HARD REQUIREMENT.", cfg.Commit.MaxLength, cfg.Commit.MaxLength))
-
-	// Add body instructions based on configuration
-	if cfg.Commit.IncludeBody {
-		prompts = append(prompts, fmt.Sprintf("STRICT REQUIREMENT: Include a commit body that is a BULLETED LIST of the distinct changes, and MUST NOT exceed %d characters. Start EVERY bullet with '- '. Write ONE bullet per meaningful change, grouping related edits together. Cover ALL significant changes across the diff - the more files and areas touched, the more bullets you should include. Each bullet must be specific about WHAT changed (name the component, function, field, enum, or behavior) rather than vague. Mention both additions AND deletions when significant. DO NOT include line statistics (+/-), raw file paths as a bare list, or diff metadata. BODY IS ABSOLUTELY REQUIRED AND MUST NOT BE EMPTY.", cfg.Commit.MaxBodyLength))
-
-		prompts = append(prompts, "EXACT OUTPUT FORMAT EXAMPLE (your response should look exactly like this):")
-		prompts = append(prompts, "feat(graphql): enhance schema with new assessment and user fields")
-		prompts = append(prompts, "")
-		prompts = append(prompts, "- Added new enums for AssessmentType and LineItemType in the schema")
-		prompts = append(prompts, "- Updated UserType to include CUSTOMER, INSURER, and CLAIMANT")
-		prompts = append(prompts, "- Enhanced Property type with bedrooms and bathrooms fields")
-		prompts = append(prompts, "- Adjusted query fields to use tax instead of GST terminology")
-
-		prompts = append(prompts, "DO NOT add any text before or after this format. Start directly with the commit type, then a blank line, then the bulleted body.")
+		p = append(p, fmt.Sprintf(
+			"Write a git commit message for the staged changes below.\n\n"+
+				"Format:\n"+
+				"<type>(<optional scope>): <subject>\n"+
+				"<blank line>\n"+
+				"- bullet\n"+
+				"- bullet\n\n"+
+				"Rules:\n"+
+				"- type is exactly one of: feat, fix, docs, style, refactor, perf, test, build, ci, chore, revert\n"+
+				"- scope is optional, lowercase, one word naming the area touched (e.g. ai, git, config)\n"+
+				"- subject: imperative mood, lowercase, no trailing period; the whole first line "+
+				"(type, scope, colon and subject together) must be under %d characters\n"+
+				"- pick the type from what the change actually does; if it does several things, "+
+				"pick the one a reader would care about most",
+			cfg.Commit.MaxLength))
 	} else {
-		prompts = append(prompts, "Do not include a commit body, only provide the subject line.")
+		p = append(p, fmt.Sprintf(
+			"Write a git commit message for the staged changes below.\n\n"+
+				"Rules:\n"+
+				"- first line: imperative mood, under %d characters, no trailing period",
+			cfg.Commit.MaxLength))
 	}
 
-	prompts = append(prompts, "CRITICAL CONSTRAINTS:")
-	prompts = append(prompts, "- Output ONLY the commit message, no explanations or analysis")
-	prompts = append(prompts, "- Do NOT start with phrases like 'Based on', 'It appears', 'This commit', etc.")
-	prompts = append(prompts, "- Do NOT include any meta-commentary about the changes")
-	prompts = append(prompts, "- Your entire response should be the commit message that will be used directly")
-	prompts = append(prompts, "- Exclude anything unnecessary. Your response will be passed directly into git commit.")
-	prompts = append(prompts, "- Start your response immediately with the commit type (e.g., 'fix:', 'feat:', etc.)")
-
-	// Add conventional commit rules if using that convention
-	if cfg.Commit.Convention == config.ConventionalCommits {
-		prompts = append(prompts, "You MUST follow these conventional commit rules:")
-		prompts = append(prompts, ConventionalCommitRules)
+	if cfg.Commit.IncludeBody {
+		p = append(p, fmt.Sprintf(
+			"- body: a blank line, then one \"- \" bullet per meaningful change, most important first\n"+
+				"- each bullet names what concretely changed (the function, type, flag, endpoint or "+
+				"behaviour) and what it does now - a reader who cannot see the diff should understand "+
+				"the change from the bullet alone\n"+
+				"- cover every significant change, grouping trivial related edits into one bullet\n"+
+				"- explain *why* where the diff makes it clear (a fix, a bound, a removed workaround)\n"+
+				"- no line counts, no bare file listings, no \"+X/-Y\", no restating the subject\n"+
+				"- keep the body under %d characters",
+			cfg.Commit.MaxBodyLength))
+	} else {
+		p = append(p, "- output the subject line only, no body")
 	}
 
-	// Add type description if using a specific convention
-	if description, ok := CommitTypeDescriptions[conventionType]; ok && description != "" {
-		prompts = append(prompts, description)
+	p = append(p, "Output only the commit message itself. No preamble, no commentary, no code fences.")
+
+	// Recent history teaches the repo's own conventions (scope vocabulary, phrasing,
+	// level of detail) far more cheaply and reliably than abstract style rules.
+	if history := GetRecentCommitSubjects(cfg); history != "" {
+		p = append(p, "Recent commits in this repository, for style reference only - do not describe them:\n"+history)
 	}
 
-	// Add format specification
-	if format, ok := CommitTypeFormats[conventionType]; ok {
-		formatExample := format
-		if cfg.Commit.IncludeBody {
-			formatExample += "\n\n<descriptive body explanation>"
+	if cfg.Context.IncludeFileNames && len(files) > 0 {
+		p = append(p, fmt.Sprintf("Files changed (%d):\n%s", len(files), strings.Join(files, "\n")))
+	}
+
+	if cfg.Context.IncludeDiff && strings.TrimSpace(changes) != "" {
+		p = append(p, "Changes:\n\n"+changes)
+	}
+
+	return strings.Join(p, "\n\n")
+}
+
+// GetRecentCommitSubjects returns recent commit subject lines so the model can match
+// the repository's established commit style. Returns an empty string on any failure -
+// style context is a bonus, never a reason to fail commit generation.
+func GetRecentCommitSubjects(cfg *config.Config) string {
+	n := cfg.Context.IncludeRecentCommits
+	if n <= 0 {
+		return ""
+	}
+
+	out, err := exec.Command("git", "log", "--no-merges", "--format=%s", fmt.Sprintf("-n%d", n)).Output()
+	if err != nil {
+		return ""
+	}
+
+	var subjects []string
+	for _, line := range strings.Split(strings.TrimSpace(string(out)), "\n") {
+		line = strings.TrimSpace(line)
+		// Release automation commits are noise as style examples.
+		if line == "" || strings.Contains(line, "[skip ci]") {
+			continue
 		}
-		prompts = append(prompts, fmt.Sprintf("The output response must be in format:\n%s", formatExample))
+		subjects = append(subjects, "  "+line)
 	}
 
-	// Add specific limit instructions for conventional commits
-	if cfg.Commit.Convention == config.ConventionalCommits {
-		prompts = append(prompts, fmt.Sprintf("For conventional commits: CRITICAL AND MOST IMPORTANT INSTRUCTION: TOTAL length of 'type(scope): subject' MUST BE STRICTLY LESS THAN %d characters. Count all characters including type, scope, colons, spaces, and subject text. Keep subject extremely brief to ensure total length stays under %d.", cfg.Commit.MaxLength, cfg.Commit.MaxLength))
-		prompts = append(prompts, fmt.Sprintf("Examples of good length subjects:\n- fix: update validation logic (%d chars)\n- feat(auth): add login timeout (%d chars)",
-			len("fix: update validation logic"),
-			len("feat(auth): add login timeout")))
-	}
+	return strings.Join(subjects, "\n")
+}
 
-	// Add guidance for analyzing the diff
-	prompts = append(prompts, `
-When analyzing the code changes:
-1. Pay careful attention to the actual diff content, ignoring any file structure or summaries
-2. Focus on what code was added/removed/modified
-3. Look for patterns across multiple files
-4. Identify the primary purpose of these changes (feature, bug fix, refactor, etc.)
-5. Be specific about what changed but keep it concise
-`)
+// reasoningTags are the opening tags reasoning-capable models emit when their chain of
+// thought leaks into the content stream instead of a separate field.
+var reasoningTags = []string{"<think>", "<thinking>", "<reasoning>"}
 
-	// Debug prompt structure before adding file data
-	if cfg.AI.Debug {
-		debugPrint(cfg, "TEXT PROMPT STRUCTURE", prompts)
-	}
-
-	// Add the git diff FIRST if enabled - this is the most important contextual information
-	if cfg.Context.IncludeDiff {
-		// Check if changes appears to be a git diff format (from GetGitDiff function)
-		if strings.Contains(changes, "diff --git") || strings.Contains(changes, "# Summary of changes") {
-			prompts = append(prompts, fmt.Sprintf("\nGit Diff:\n```\n%s\n```", changes))
-		} else {
-			// Token-aware truncation (secondary check; main truncation happens in GenerateCommitMessage)
-			tokenizerModel := cfg.Context.TokenizerModel
-			if tokenizerModel == "" {
-				tokenizerModel = cfg.AI.Model
+// stripReasoningBlocks removes leaked chain-of-thought from a model response.
+//
+// A tag only counts as leaked reasoning when it opens a line, which is how models emit
+// it. A tag appearing mid-line is prose the model wrote about reasoning tags - a commit
+// message that describes this very code will contain one - and must survive verbatim.
+// Treating those as block openers truncated the body at the mention.
+func stripReasoningBlocks(response string) string {
+	for _, open := range reasoningTags {
+		closeTag := strings.Replace(open, "<", "</", 1)
+		for offset := 0; ; {
+			idx := strings.Index(response[offset:], open)
+			if idx < 0 {
+				break
 			}
-
-			originalTokens := tokenizer.CountTokens(changes, tokenizerModel)
-			maxContextTokens := cfg.Context.MaxInputTokens
-			if maxContextTokens == 0 {
-				maxContextTokens = 100000
+			start := offset + idx
+			if start > 0 && response[start-1] != '\n' {
+				// Mid-line mention, not a block opener: skip past it and keep looking.
+				offset = start + len(open)
+				continue
 			}
-
-			if originalTokens > maxContextTokens {
-				changes = tokenizer.TruncateToTokenLimit(changes, maxContextTokens, tokenizerModel)
-				if cfg.AI.Debug {
-					newTokens := tokenizer.CountTokens(changes, tokenizerModel)
-					debugPrint(cfg, "TRUNCATED", fmt.Sprintf("%d → %d tokens", originalTokens, newTokens))
-				}
+			end := strings.Index(response[start:], closeTag)
+			if end < 0 {
+				// Unterminated block: everything after it is reasoning, not a message.
+				response = response[:start]
+				break
 			}
-			prompts = append(prompts, fmt.Sprintf("\nDiff changes:\n```\n%s\n```", changes))
+			response = response[:start] + response[start+end+len(closeTag):]
+			offset = start
 		}
 	}
+	return response
+}
 
-	// Add repository structure if enabled (as secondary context)
-	if cfg.Context.IncludeRepoStructure {
-		repoStructure, err := GetRepoStructure(cfg)
-		if err == nil && repoStructure != "" {
-			prompts = append(prompts, "\n"+repoStructure)
-		}
-	}
+// sanitizeResponse strips wrappers that reasoning-capable and chat-tuned models put
+// around a commit message. Without this the first line of the response - a stray code
+// fence or a leftover <think> block - would be parsed as the subject line.
+func sanitizeResponse(response string) string {
+	response = stripReasoningBlocks(response)
 
-	// Gather enhanced file information if any enhanced options are enabled
-	if cfg.Context.IncludeFileStats || cfg.Context.IncludeFileSummaries || cfg.Context.ShowFirstLinesOfFile > 0 {
-		enhancedInfos, err := GatherEnhancedFileInfo(cfg, files)
-		if err == nil && len(enhancedInfos) > 0 {
-			// Add detailed file information section
-			prompts = append(prompts, "\nFile changes in detail:")
+	lines := strings.Split(strings.TrimSpace(response), "\n")
 
-			for _, info := range enhancedInfos {
-				fileDetails := []string{fmt.Sprintf("* %s", info.Path)}
-
-				// Add file type and summary
-				if info.Summary != "" {
-					fileDetails = append(fileDetails, fmt.Sprintf("  Type: %s - %s", strings.ToUpper(info.FileType), info.Summary))
-				} else if info.FileType != "" {
-					fileDetails = append(fileDetails, fmt.Sprintf("  Type: %s", strings.ToUpper(info.FileType)))
-				}
-
-				// Add change statistics
-				if cfg.Context.IncludeFileStats && (info.AddedLines > 0 || info.RemovedLines > 0) {
-					fileDetails = append(fileDetails, fmt.Sprintf("  Changes: +%d/-%d lines", info.AddedLines, info.RemovedLines))
-					if info.PercentageChange != "" {
-						fileDetails = append(fileDetails, fmt.Sprintf("  Modified: %s of file", info.PercentageChange))
-					}
-				}
-
-				// Add first lines of the file if available (but not if diff is included to avoid duplication)
-				if info.FirstLines != "" && !cfg.Context.IncludeDiff {
-					fileDetails = append(fileDetails, fmt.Sprintf("  First %d lines:\n```\n%s\n```",
-						cfg.Context.ShowFirstLinesOfFile, info.FirstLines))
-				}
-
-				prompts = append(prompts, strings.Join(fileDetails, "\n"))
+	// Drop a leading fence (```/```text) and its matching closer.
+	for len(lines) > 0 && strings.HasPrefix(strings.TrimSpace(lines[0]), "```") {
+		lines = lines[1:]
+		for i := len(lines) - 1; i >= 0; i-- {
+			if strings.HasPrefix(strings.TrimSpace(lines[i]), "```") {
+				lines = append(lines[:i], lines[i+1:]...)
+				break
 			}
 		}
-	} else if cfg.Context.IncludeFileNames {
-		// Just add the file names if detailed info is not enabled
-		prompts = append(prompts, fmt.Sprintf("\nFiles changed:\n%s", strings.Join(files, "\n")))
 	}
 
-	// Final constraint to ensure clean output
-	prompts = append(prompts, "\nREMEMBER: Your response must be ONLY the commit message. Do not include any analysis, explanation, or extra text. Start immediately with the commit type, followed by a blank line and a bulleted body that covers all significant changes.")
+	// Drop leading blank lines and conversational preamble before the subject.
+	for len(lines) > 0 {
+		first := strings.TrimSpace(lines[0])
+		if first == "" {
+			lines = lines[1:]
+			continue
+		}
+		lower := strings.ToLower(first)
+		if strings.HasSuffix(first, ":") && !strings.Contains(first, " ") {
+			break // looks like "feat:" style, keep it
+		}
+		if strings.HasPrefix(lower, "here is") || strings.HasPrefix(lower, "here's") ||
+			strings.HasPrefix(lower, "sure,") || strings.HasPrefix(lower, "commit message:") {
+			lines = lines[1:]
+			continue
+		}
+		break
+	}
 
-	return strings.Join(prompts, "\n")
+	return strings.TrimSpace(strings.Join(lines, "\n"))
 }
 
 // ParseCommitMessageJSON attempts to parse a JSON response into a CommitMessage struct
 func ParseCommitMessageJSON(response string) (CommitMessage, error) {
 	var msg CommitMessage
 	var parseErr error
+
+	response = sanitizeResponse(response)
 
 	// First try to extract JSON from the response if it contains other text
 	jsonStr := extractJSON(response)
@@ -716,33 +706,6 @@ func DisplayStagedFiles(files []string) {
 	fmt.Println("\n\033[1;36m🔍 Analyzing changes...\033[0m")
 }
 
-// getFileIcon returns an appropriate icon based on file extension
-func getFileIcon(file string) string {
-	ext := strings.ToLower(filepath.Ext(file))
-	switch ext {
-	case ".go":
-		return "🔵"
-	case ".js", ".jsx", ".ts", ".tsx":
-		return "🟡"
-	case ".py":
-		return "🟢"
-	case ".md":
-		return "📝"
-	case ".yaml", ".yml", ".json":
-		return "⚙️"
-	case ".css", ".scss", ".sass":
-		return "🎨"
-	case ".html", ".htm":
-		return "🌐"
-	case ".sh", ".bash":
-		return "🐚"
-	case ".dockerfile", ".docker":
-		return "🐳"
-	default:
-		return "📄"
-	}
-}
-
 // wrapText wraps text at the specified width while preserving indentation
 func wrapText(text string, width int, indent string) string {
 	words := strings.Fields(text)
@@ -861,6 +824,43 @@ func GetGitDiff(files []string) (string, error) {
 	return string(diffOutput), nil
 }
 
+// Token budgets for the final commit-message call.
+const (
+	// promptOverheadTokens is the size of everything in the prompt that is not the
+	// diff: instructions, recent-commit style context and the file list.
+	promptOverheadTokens = 1000
+
+	// minDiffBudgetTokens keeps a usable amount of diff even when a small context
+	// window and a large response budget would otherwise squeeze it to nothing.
+	minDiffBudgetTokens = 500
+
+	// maxResponseTokens caps generation for the final call. A commit message with a
+	// full bulleted body runs a few hundred tokens; local endpoints generate at
+	// roughly 10-50 tok/s, so an oversized cap only lets the model run long.
+	maxResponseTokens = 1500
+
+	// bodyCharsPerToken converts the configured body character limit into a rough
+	// token budget, so a user asking for a long body still gets room to produce one.
+	bodyCharsPerToken = 4
+)
+
+// responseTokenBudget returns the generation cap for the final commit-message call:
+// enough for the configured body, but never the user's full context-sized budget.
+func responseTokenBudget(cfg *config.Config) int {
+	needed := 200 // subject, formatting and a short body
+	if cfg.Commit.IncludeBody && cfg.Commit.MaxBodyLength > 0 {
+		needed += cfg.Commit.MaxBodyLength / bodyCharsPerToken
+	}
+	if needed > maxResponseTokens {
+		needed = maxResponseTokens
+	}
+	// Respect an explicitly smaller user setting, but never inherit a huge one.
+	if cfg.AI.MaxTokens > 0 && cfg.AI.MaxTokens < needed {
+		return cfg.AI.MaxTokens
+	}
+	return needed
+}
+
 // GenerateCommitMessage generates a commit message using the configured AI provider
 func GenerateCommitMessage(cfg *config.Config, files []string, changes string) (string, error) {
 	// Display staged files in TUI format if enabled
@@ -868,16 +868,7 @@ func GenerateCommitMessage(cfg *config.Config, files []string, changes string) (
 		DisplayStagedFiles(files)
 	}
 
-	// Get more detailed git diff if requested
-	var detailedDiff string
 	var err error
-	if cfg.Context.IncludeDiff {
-		detailedDiff, err = GetGitDiff(files)
-		if err == nil && detailedDiff != "" {
-			// Use the detailed diff instead of the basic changes
-			changes = detailedDiff
-		}
-	}
 
 	// Token-aware processing
 	tokenizerModel := cfg.Context.TokenizerModel
@@ -891,66 +882,59 @@ func GenerateCommitMessage(cfg *config.Config, files []string, changes string) (
 		maxTokens = tokenizer.GetProviderTokenLimit(string(cfg.AI.Provider), cfg.AI.Model)
 	}
 
-	// Reserve space for prompt overhead and response.
-	// Prompt overhead: system prompt + user message instructions (~4K tokens actual).
-	// Response: cfg.AI.MaxTokens (usually 1000-5000)
-	promptOverhead := 4000
-	responseTokens := cfg.AI.MaxTokens
-	if responseTokens == 0 {
-		responseTokens = 5000
+	// The diff budget is what actually governs latency: prompt evaluation is the
+	// dominant cost of a commit-message call, and it scales with the diff we send.
+	// It is deliberately far below the model's context limit - a commit message needs
+	// to see what changed, not every line of it.
+	diffBudget := cfg.Context.MaxDiffTokens
+	if diffBudget <= 0 {
+		diffBudget = defaultMaxDiffTokens
 	}
-	// Calculate available space for changes
-	availableForChanges := maxTokens - promptOverhead - responseTokens
-	if availableForChanges < 500 {
-		availableForChanges = 500 // Minimum viable budget for changes
+	// Never exceed what the context window can actually hold alongside the response.
+	responseTokens := responseTokenBudget(cfg)
+	if ceiling := maxTokens - promptOverheadTokens - responseTokens; diffBudget > ceiling {
+		diffBudget = ceiling
+	}
+	if diffBudget < minDiffBudgetTokens {
+		diffBudget = minDiffBudgetTokens
 	}
 
-	// Debug: Show token analysis
+	// Reduce the diff deterministically, with no LLM round-trips. Each extra call to a
+	// self-hosted endpoint costs another full prompt evaluation plus queue wait, so
+	// summarizing a diff by asking the model about it is slower than simply sending it.
+	if cfg.Context.IncludeDiff {
+		changes = CompactDiff(changes, diffBudget, tokenizerModel)
+	}
+	compactedTokens := tokenizer.CountTokens(changes, tokenizerModel)
+
 	if cfg.AI.Debug {
-		debugPrint(cfg, "TOKEN ANALYSIS", map[string]interface{}{
-			"input_tokens":          inputTokens,
-			"max_tokens":            maxTokens,
-			"prompt_overhead":       promptOverhead,
-			"response_tokens":       responseTokens,
-			"available_for_changes": availableForChanges,
-			"model":                 tokenizerModel,
+		debugPrint(cfg, "TOKEN ANALYSIS", map[string]any{
+			"input_tokens":     inputTokens,
+			"compacted_tokens": compactedTokens,
+			"diff_budget":      diffBudget,
+			"max_tokens":       maxTokens,
+			"response_tokens":  responseTokens,
+			"model":            tokenizerModel,
 		})
 	}
 
-	// Apply hierarchical summarization if exceeds available space
-	// Never truncates silently - every file always appears at least as a stub
-	if inputTokens > availableForChanges {
-		debugPrint(cfg, "HIERARCHICAL SUMMARIZATION", fmt.Sprintf("Input %d tokens > %d available tokens", inputTokens, availableForChanges))
-
-		processed, processErr := HierarchicalSummarize(cfg, changes, availableForChanges)
-
-		if processErr == nil {
-			changes = processed
-			finalTokens := tokenizer.CountTokens(changes, tokenizerModel)
-			debugPrint(cfg, "PROCESSED RESULT", fmt.Sprintf("%d → %d tokens (%.1f%% reduction)", inputTokens, finalTokens, 100.0*(1.0-float64(finalTokens)/float64(inputTokens))))
-		} else {
-			debugPrint(cfg, "PROCESSING ERROR", processErr.Error())
-			// We never truncate silently - return error to caller
-			return "", fmt.Errorf("failed to summarize large diff: %w", processErr)
-		}
+	if inputTokens > compactedTokens {
+		fmt.Printf("\033[38;5;244m   %d → %d diff tokens\033[0m\n", inputTokens, compactedTokens)
 	}
-
-	// Final token count after hierarchical summarization
-	finalChangesTokens := tokenizer.CountTokens(changes, tokenizerModel)
 
 	// Debug: Show input data
 	if cfg.AI.Debug {
 		debugPrint(cfg, "INPUT FILES", files)
-		debugPrint(cfg, "INPUT CHANGES (final)", fmt.Sprintf("%d chars, %d tokens", len(changes), finalChangesTokens))
-		debugPrint(cfg, "CONFIG SETTINGS", map[string]interface{}{
-			"Convention":       cfg.Commit.Convention,
-			"IncludeBody":      cfg.Commit.IncludeBody,
-			"MaxLength":        cfg.Commit.MaxLength,
-			"MaxBodyLength":    cfg.Commit.MaxBodyLength,
-			"Provider":         cfg.AI.Provider,
-			"Model":            cfg.AI.Model,
-			"MaxInputTokens":   cfg.Context.MaxInputTokens,
-			"DiffStrategy":     cfg.Context.DiffStrategy,
+		debugPrint(cfg, "INPUT CHANGES (final)", fmt.Sprintf("%d chars, %d tokens", len(changes), compactedTokens))
+		debugPrint(cfg, "CONFIG SETTINGS", map[string]any{
+			"Convention":     cfg.Commit.Convention,
+			"IncludeBody":    cfg.Commit.IncludeBody,
+			"MaxLength":      cfg.Commit.MaxLength,
+			"MaxBodyLength":  cfg.Commit.MaxBodyLength,
+			"Provider":       cfg.AI.Provider,
+			"Model":          cfg.AI.Model,
+			"MaxInputTokens": cfg.Context.MaxInputTokens,
+			"MaxDiffTokens":  diffBudget,
 		})
 	}
 
@@ -968,53 +952,12 @@ func GenerateCommitMessage(cfg *config.Config, files []string, changes string) (
 	// Debug: Show the prompt being sent to the AI
 	debugPrint(cfg, "AI PROMPT", prompt)
 
-	// Final safety check: ensure prompt doesn't exceed safe limit
-	promptTokens := tokenizer.CountTokens(prompt, tokenizerModel)
-	finalResponseTokens := cfg.AI.MaxTokens
-	if finalResponseTokens == 0 {
-		finalResponseTokens = 5000
-	}
-	safeLimit := maxTokens - finalResponseTokens - 2000 // Buffer for system message overhead
-
 	if cfg.AI.Debug {
-		debugPrint(cfg, "FINAL TOKEN CHECK", map[string]interface{}{
-			"prompt_tokens":   promptTokens,
-			"response_tokens": finalResponseTokens,
-			"safe_limit":      safeLimit,
-			"total_would_be":  promptTokens + finalResponseTokens,
+		debugPrint(cfg, "FINAL TOKEN CHECK", map[string]any{
+			"prompt_tokens":   tokenizer.CountTokens(prompt, tokenizerModel),
+			"response_tokens": responseTokens,
 			"max_tokens":      maxTokens,
 		})
-	}
-
-	// If still too large, do emergency truncation by rebuilding with minimal info
-	if promptTokens > safeLimit {
-		debugPrint(cfg, "EMERGENCY TRUNCATION", fmt.Sprintf("Prompt %d tokens exceeds safe limit %d, using summary only", promptTokens, safeLimit))
-
-		// Extract just a summary of changes for emergency mode
-		summary := extractKeyDiffContent(changes)
-		summaryTokens := tokenizer.CountTokens(summary, tokenizerModel)
-		maxSummaryTokens := safeLimit / 2 // Use half the safe limit for summary
-
-		if summaryTokens > maxSummaryTokens {
-			summary = tokenizer.TruncateToTokenLimit(summary, maxSummaryTokens, tokenizerModel)
-		}
-
-		// Rebuild prompt with minimal overhead
-		minimalPrompt := fmt.Sprintf(`Generate a concise commit message for these changes. Use conventional commits format (type: subject).
-
-Changes summary:
-%s
-
-Files: %s
-
-Output ONLY the commit message, nothing else. Keep subject under %d characters.`,
-			summary,
-			strings.Join(files, ", "),
-			cfg.Commit.MaxLength)
-
-		prompt = minimalPrompt
-		promptTokens = tokenizer.CountTokens(prompt, tokenizerModel)
-		debugPrint(cfg, "EMERGENCY PROMPT", fmt.Sprintf("Rebuilt prompt: %d tokens", promptTokens))
 	}
 
 	var rawResponse string
@@ -1022,8 +965,9 @@ Output ONLY the commit message, nothing else. Keep subject under %d characters.`
 	// Get system prompt
 	systemPrompt := getSystemPrompt(cfg)
 
-	// Call LLM using unified dispatcher
-	rawResponse, err = CallLLM(cfg, systemPrompt, prompt)
+	// Generation is billed in wall time too: a commit message needs a few hundred
+	// tokens, so an unbounded response budget only buys the model room to ramble.
+	rawResponse, err = CallLLM(withMaxTokens(cfg, responseTokens), systemPrompt, prompt)
 
 	if err != nil {
 		debugPrint(cfg, "AI ERROR", err.Error())
@@ -1080,152 +1024,34 @@ Output ONLY the commit message, nothing else. Keep subject under %d characters.`
 	// Debug: Show the parsed commit message
 	debugPrint(cfg, "PARSED COMMIT", commitMsg)
 
-	// Ensure the body is not empty if it's required
-	if cfg.Commit.IncludeBody && (commitMsg.Body == "" || strings.TrimSpace(commitMsg.Body) == "") {
-		// If no body was parsed, extract a reasonable body from the changes
-		commitMsg.Body = generateDefaultBody(cfg, files, changes)
-		debugPrint(cfg, "GENERATED DEFAULT BODY", commitMsg.Body)
+	// A missing body is left missing. Substituting boilerplate like "Update N files
+	// with necessary changes" is worse than a subject-only commit: it reads as though
+	// it describes the change while saying nothing.
+	if cfg.Commit.IncludeBody && strings.TrimSpace(commitMsg.Body) == "" {
+		debugPrint(cfg, "NO BODY RETURNED", "model returned no body; committing subject only")
 	}
 
-	// Verify message length constraints before formatting
-	subjectLength := 0
-	if cfg.Commit.Convention == config.ConventionalCommits && commitMsg.Type != "" {
-		// For conventional commits, calculate full subject with type and scope
-		if commitMsg.Scope != "" {
-			subjectLength = len(commitMsg.Type) + len(commitMsg.Scope) + len(commitMsg.Subject) + 4 // +4 for "(): "
-		} else {
-			subjectLength = len(commitMsg.Type) + len(commitMsg.Subject) + 2 // +2 for ": "
-		}
-	} else {
-		subjectLength = len(commitMsg.Subject)
+	// Normalize the message to the configured convention. Every step here is
+	// conservative: it repairs form (casing, stray punctuation, a missing type) but
+	// never discards content the model wrote, because the model saw the diff and this
+	// code did not. Earlier revisions rewrote or blanked bodies that tripped keyword
+	// heuristics, which turned good messages into "Update N files with necessary changes".
+	if cfg.Commit.Convention == config.ConventionalCommits {
+		commitMsg = normalizeConventionalCommit(commitMsg)
 	}
 
-	// Check if subject exceeds max length - hard enforce the limit
-	if subjectLength > cfg.Commit.MaxLength {
-		// Always attempt to truncate the subject to meet the limit
-		if cfg.Commit.Convention == config.ConventionalCommits && commitMsg.Type != "" {
-			// Calculate maximum space available for the subject
-			maxSubjectSpace := cfg.Commit.MaxLength
-			if commitMsg.Scope != "" {
-				maxSubjectSpace = cfg.Commit.MaxLength - len(commitMsg.Type) - len(commitMsg.Scope) - 4
-			} else {
-				maxSubjectSpace = cfg.Commit.MaxLength - len(commitMsg.Type) - 2
-			}
+	commitMsg.Subject = fitSubject(commitMsg, cfg)
 
-			// Truncate subject if there's any space left
-			if maxSubjectSpace > 3 {
-				// Preserve meaning by truncating smartly - take first part of subject
-				originalSubject := commitMsg.Subject
-				if maxSubjectSpace < len(originalSubject) {
-					// Find a good breaking point (space, comma, etc.) if possible
-					breakPoint := maxSubjectSpace - 3
-					for i := breakPoint; i > breakPoint-10 && i > 0; i-- {
-						if originalSubject[i] == ' ' || originalSubject[i] == ',' || originalSubject[i] == ';' {
-							breakPoint = i
-							break
-						}
-					}
-					commitMsg.Subject = originalSubject[:breakPoint] + "..."
-				}
-
-				// Recalculate the total length
-				if commitMsg.Scope != "" {
-					subjectLength = len(commitMsg.Type) + len(commitMsg.Scope) + len(commitMsg.Subject) + 4
-				} else {
-					subjectLength = len(commitMsg.Type) + len(commitMsg.Subject) + 2
-				}
-			}
-		} else {
-			// For non-conventional commits, just truncate the subject
-			if len(commitMsg.Subject) > cfg.Commit.MaxLength {
-				// Find a good breaking point (space, comma, etc.) if possible
-				breakPoint := cfg.Commit.MaxLength - 3
-				for i := breakPoint; i > breakPoint-10 && i > 0; i-- {
-					if commitMsg.Subject[i] == ' ' || commitMsg.Subject[i] == ',' || commitMsg.Subject[i] == ';' {
-						breakPoint = i
-						break
-					}
-				}
-				commitMsg.Subject = commitMsg.Subject[:breakPoint] + "..."
-				subjectLength = len(commitMsg.Subject)
-			}
-		}
-
-		// If still too long after truncation, force more aggressive truncation
-		if subjectLength > cfg.Commit.MaxLength {
-			if cfg.Commit.Convention == config.ConventionalCommits && commitMsg.Type != "" {
-				// For conventional commits, preserve type and scope, but severely truncate subject
-				fixedType := commitMsg.Type
-				fixedScope := commitMsg.Scope
-
-				availableSpace := cfg.Commit.MaxLength
-				if fixedScope != "" {
-					availableSpace = cfg.Commit.MaxLength - len(fixedType) - len(fixedScope) - 4
-				} else {
-					availableSpace = cfg.Commit.MaxLength - len(fixedType) - 2
-				}
-
-				// Ensure minimum subject space
-				if availableSpace < 10 {
-					// If necessary, truncate scope to make room for subject
-					if fixedScope != "" && len(fixedScope) > 5 {
-						fixedScope = fixedScope[:5]
-						if fixedScope != "" {
-							availableSpace = cfg.Commit.MaxLength - len(fixedType) - len(fixedScope) - 4
-						} else {
-							availableSpace = cfg.Commit.MaxLength - len(fixedType) - 2
-						}
-					}
-				}
-
-				// Create a very brief subject if needed
-				if availableSpace < 10 {
-					commitMsg.Subject = "update"
-				} else {
-					commitMsg.Subject = commitMsg.Subject[:availableSpace-3] + "..."
-				}
-
-				// Update the values
-				commitMsg.Type = fixedType
-				commitMsg.Scope = fixedScope
-
-				// Recalculate final length
-				if commitMsg.Scope != "" {
-					subjectLength = len(commitMsg.Type) + len(commitMsg.Scope) + len(commitMsg.Subject) + 4
-				} else {
-					subjectLength = len(commitMsg.Type) + len(commitMsg.Subject) + 2
-				}
-			} else {
-				// For other commits, hard truncate
-				commitMsg.Subject = commitMsg.Subject[:cfg.Commit.MaxLength-3] + "..."
-				subjectLength = len(commitMsg.Subject)
-			}
-
-			// Add debug entry showing we did aggressive truncation
-			debugPrint(cfg, "AGGRESSIVE TRUNCATION", fmt.Sprintf("Truncated subject to length %d", subjectLength))
-		}
+	if cfg.Commit.IncludeBody && cfg.Commit.MaxBodyLength > 0 && len(commitMsg.Body) > cfg.Commit.MaxBodyLength {
+		commitMsg.Body = trimBodyToBullets(commitMsg.Body, cfg.Commit.MaxBodyLength)
+		debugPrint(cfg, "TRIMMED BODY", commitMsg.Body)
 	}
 
-	// Check if body exceeds max length when body is included
-	if cfg.Commit.IncludeBody && len(commitMsg.Body) > cfg.Commit.MaxBodyLength {
-		// Truncate the body to the maximum allowed length
-		commitMsg.Body = commitMsg.Body[:cfg.Commit.MaxBodyLength-3] + "..."
-		debugPrint(cfg, "TRUNCATED BODY", commitMsg.Body)
-	}
-
-	// Validate against conventional commit rules if needed
 	if cfg.Commit.Convention == config.ConventionalCommits {
 		if err := validateConventionalCommit(commitMsg, cfg); err != nil {
-			debugPrint(cfg, "CONVENTIONAL COMMIT VALIDATION ERROR", err.Error())
-			// Try to fix common issues
-			commitMsg = fixConventionalCommitIssues(commitMsg)
-
-			// Re-validate after fixing
-			if err := validateConventionalCommit(commitMsg, cfg); err != nil && cfg.Commit.IncludeBody && (commitMsg.Body == "" || strings.TrimSpace(commitMsg.Body) == "") {
-				// If the body is still empty, add a minimal body
-				commitMsg.Body = generateDefaultBody(cfg, files, changes)
-				debugPrint(cfg, "ADDED DEFAULT BODY", commitMsg.Body)
-			}
+			// The message is still used: a soft-rule violation is worth a warning, not
+			// a silent rewrite into something less informative.
+			debugPrint(cfg, "CONVENTIONAL COMMIT VALIDATION WARNING", err.Error())
 		}
 	}
 
@@ -1239,7 +1065,7 @@ Output ONLY the commit message, nothing else. Keep subject under %d characters.`
 	if cfg.UI.EnableTUI {
 		fmt.Println("\n\033[1;36m💬 Generated Commit Message\033[0m")
 		fmt.Println("\033[38;5;244m────────────────────────\033[0m")
-		
+
 		// Display the commit message with proper formatting
 		lines := strings.Split(formattedMessage, "\n")
 		for _, line := range lines {
@@ -1253,47 +1079,6 @@ Output ONLY the commit message, nothing else. Keep subject under %d characters.`
 	}
 
 	return formattedMessage, nil
-}
-
-// generateDefaultBody creates a basic commit body when the AI doesn't provide one
-func generateDefaultBody(cfg *config.Config, files []string, changes string) string {
-	// Default basic description
-	defaultBody := "Update code with necessary changes"
-
-	// Try to generate a more meaningful body based on the changes
-	if len(files) == 1 {
-		// If only one file was changed, mention it
-		fileExt := strings.TrimPrefix(filepath.Ext(files[0]), ".")
-		fileName := filepath.Base(files[0])
-
-		if fileExt != "" {
-			switch fileExt {
-			case "go":
-				return fmt.Sprintf("Update %s with improved Go code implementation", fileName)
-			case "js", "jsx", "ts", "tsx":
-				return fmt.Sprintf("Enhance %s with better JavaScript/TypeScript functionality", fileName)
-			case "py":
-				return fmt.Sprintf("Update Python implementation in %s", fileName)
-			case "md", "markdown":
-				return fmt.Sprintf("Improve documentation in %s", fileName)
-			case "css", "scss", "sass":
-				return fmt.Sprintf("Update styles in %s", fileName)
-			case "html":
-				return fmt.Sprintf("Update HTML template in %s", fileName)
-			case "json", "yaml", "yml":
-				return fmt.Sprintf("Update configuration in %s", fileName)
-			default:
-				return fmt.Sprintf("Update %s file", fileName)
-			}
-		} else {
-			return fmt.Sprintf("Update %s", fileName)
-		}
-	} else if len(files) > 1 {
-		// If multiple files were changed, provide a count
-		return fmt.Sprintf("Update %d files with necessary changes", len(files))
-	}
-
-	return defaultBody
 }
 
 // buildPrompt creates a prompt for the AI based on the configuration using JSON templates
@@ -1498,54 +1283,13 @@ func getSystemPrompt(cfg *config.Config) string {
 		return cfg.AI.SystemPrompt
 	}
 
-	// For conventional commits, use a more specific prompt that matches text prompt style
-	if cfg.Commit.Convention == config.ConventionalCommits {
-		promptParts := []string{
-			"Generate a concise git commit message written in present tense for the following code changes.",
-			"YOUR RESPONSE MUST START WITH A CONVENTIONAL COMMIT TYPE FOLLOWED BY A COLON. Valid types are: feat, fix, docs, style, refactor, perf, test, build, ci, chore, revert.",
-			"INCORRECT: ': description of changes' - This lacks a commit type",
-			"CORRECT: 'feat: add new feature' - This has a proper commit type",
-			fmt.Sprintf("CRITICAL REQUIREMENT: Commit message subject MUST NOT exceed %d characters total. YOU MUST COUNT THE CHARACTERS YOURSELF AND ENSURE THE TOTAL IS UNDER %d. This is a HARD REQUIREMENT.", cfg.Commit.MaxLength, cfg.Commit.MaxLength),
-			fmt.Sprintf("CRITICAL: The TOTAL combined length of 'type(scope): subject' must be strictly under %d characters. Adjust the subject accordingly.", cfg.Commit.MaxLength),
-			fmt.Sprintf("If using 'feat(scope): subject' format, the ENTIRE string including 'feat(scope): ' counts toward the %d character limit.", cfg.Commit.MaxLength),
-		}
-
-		// Add conventional commit rules
-		promptParts = append(promptParts, "You MUST follow these conventional commit rules:")
-		promptParts = append(promptParts, ConventionalCommitRules)
-
-		// Add body instructions
-		if cfg.Commit.IncludeBody {
-			promptParts = append(promptParts, fmt.Sprintf("STRICT REQUIREMENT: Body is REQUIRED and MUST NOT be empty. Format the body as a BULLETED LIST, with every bullet starting with '- '. Include one bullet per meaningful change and cover ALL significant changes across the diff - more files/areas touched means more bullets. Each bullet MUST be specific about what changed (name the component, function, field, or behavior). The body MUST NOT exceed %d characters. NEVER include line statistics (+/-) or raw diff metadata.", cfg.Commit.MaxBodyLength))
-		} else {
-			promptParts = append(promptParts, "Do not include a commit body, only provide the subject line.")
-		}
-
-		// Add type descriptions for conventional commits
-		promptParts = append(promptParts, `Choose an appropriate type from these options:
-- feat: A new feature
-- fix: A bug fix
-- docs: Documentation only changes
-- style: Changes that do not affect the meaning of the code (whitespace, formatting, etc)
-- refactor: A code change that neither fixes a bug nor adds a feature
-- perf: A code change that improves performance
-- test: Adding missing tests or correcting existing tests
-- build: Changes that affect the build system or external dependencies
-- ci: Changes to CI configuration files and scripts
-- chore: Other changes that don't modify source or test files
-- revert: Reverts a previous commit`)
-
-		// Add examples of good length subjects
-		promptParts = append(promptParts, fmt.Sprintf("Examples of good length subjects that meet the %d character limit:\n- fix: update validation logic (%d chars)\n- feat(auth): add login timeout (%d chars)",
-			cfg.Commit.MaxLength,
-			len("fix: update validation logic"),
-			len("feat(auth): add login timeout")))
-
-		return strings.Join(promptParts, "\n")
-	}
-
-	// Otherwise use default system prompt
-	return "You are an expert developer who writes clear, concise, and descriptive git commit messages that do not exceed the specified character limits."
+	// The format rules live in the user message, next to the diff they apply to.
+	// Repeating them here would double their token cost and give the model two copies
+	// to reconcile; the system prompt only sets the role and the output contract.
+	return "You are a senior software engineer writing the commit message for a change " +
+		"you just made. You read a diff and explain what the change does and why, " +
+		"accurately and specifically, never inventing anything the diff does not show. " +
+		"You reply with the commit message and nothing else."
 }
 
 // debugPrint prints debug information if debug mode is enabled
@@ -1912,17 +1656,23 @@ func validateConventionalCommit(msg CommitMessage, cfg *config.Config) error {
 	return nil
 }
 
-// fixConventionalCommitIssues attempts to fix common issues in conventional commits
-func fixConventionalCommitIssues(msg CommitMessage) CommitMessage {
-	// Fix type case
-	msg.Type = strings.ToLower(msg.Type)
+// normalizeConventionalCommit repairs the *form* of a commit message without altering
+// what it says: type casing and common misspellings, subject capitalization and stray
+// trailing punctuation, scope casing. It deliberately does not rewrite wording or drop
+// body lines - the model saw the diff, so its content is more trustworthy than any
+// keyword heuristic here.
+func normalizeConventionalCommit(msg CommitMessage) CommitMessage {
+	msg.Type = strings.ToLower(strings.TrimSpace(msg.Type))
 
-	// Fix common type misspellings
 	typeCorrections := map[string]string{
 		"feature":       "feat",
+		"features":      "feat",
 		"bugfix":        "fix",
+		"bug":           "fix",
+		"hotfix":        "fix",
 		"document":      "docs",
 		"documentation": "docs",
+		"doc":           "docs",
 		"styling":       "style",
 		"refactoring":   "refactor",
 		"performance":   "perf",
@@ -1931,94 +1681,100 @@ func fixConventionalCommitIssues(msg CommitMessage) CommitMessage {
 		"building":      "build",
 		"maintenance":   "chore",
 	}
-
-	if correctedType, ok := typeCorrections[msg.Type]; ok {
-		msg.Type = correctedType
+	if corrected, ok := typeCorrections[msg.Type]; ok {
+		msg.Type = corrected
+	}
+	if !isValidCommitType(msg.Type) {
+		msg.Type = "chore"
 	}
 
-	// Remove trailing period from subject
-	if strings.HasSuffix(msg.Subject, ".") {
-		msg.Subject = msg.Subject[:len(msg.Subject)-1]
-	}
+	msg.Subject = strings.TrimSpace(msg.Subject)
+	msg.Subject = strings.TrimSuffix(msg.Subject, ".")
 
-	// Convert first letter of subject to lowercase
-	if len(msg.Subject) > 0 && unicode.IsUpper([]rune(msg.Subject)[0]) {
-		r := []rune(msg.Subject)
-		r[0] = unicode.ToLower(r[0])
-		msg.Subject = string(r)
-	}
-
-	// Fix generic subjects
-	genericSubjects := map[string]string{
-		"update": "improve",
-		"change": "modify",
-		"modify": "enhance",
-		"add":    "implement",
-		"remove": "delete",
-		"delete": "remove",
-		"fix":    "resolve",
-	}
-
-	if replacement, ok := genericSubjects[strings.ToLower(msg.Subject)]; ok {
-		msg.Subject = replacement
-	}
-
-	// Clean up body if present
-	if msg.Body != "" {
-		// Remove common problematic phrases from start of body
-		bodyLines := strings.Split(msg.Body, "\n")
-		if len(bodyLines) > 0 {
-			firstLine := strings.ToLower(bodyLines[0])
-			removePhrases := []string{
-				"this code",
-				"the changes",
-				"this commit",
-				"the code",
-				"the file",
-				"the files",
-				"the changes made",
-				"the changes include",
-				"the changes made to",
-			}
-
-			for _, phrase := range removePhrases {
-				if strings.HasPrefix(firstLine, phrase) {
-					bodyLines[0] = strings.TrimSpace(strings.TrimPrefix(bodyLines[0], phrase))
-					break
-				}
-			}
-		}
-
-		// Remove file lists
-		var cleanedLines []string
-		for _, line := range bodyLines {
-			if !strings.Contains(strings.ToLower(line), "file:") &&
-				!strings.Contains(strings.ToLower(line), "files:") &&
-				!strings.Contains(strings.ToLower(line), "changed files:") {
-				cleanedLines = append(cleanedLines, line)
-			}
-		}
-
-		msg.Body = strings.Join(cleanedLines, "\n")
-		msg.Body = strings.TrimSpace(msg.Body)
-
-		// Ensure proper separation from subject
-		if !strings.Contains(msg.Body, "\n\n") {
-			msg.Body = "\n\n" + msg.Body
+	// Lowercase the first letter only when it is not part of an identifier or acronym
+	// ("API", "GetStagedFiles"): downcasing those would misname real symbols.
+	if r := []rune(msg.Subject); len(r) > 0 && unicode.IsUpper(r[0]) {
+		first := strings.Fields(msg.Subject)
+		if len(first) > 0 && !hasInnerUpper(first[0]) {
+			r[0] = unicode.ToLower(r[0])
+			msg.Subject = string(r)
 		}
 	}
 
-	// Fix scope if present
 	if msg.Scope != "" {
-		msg.Scope = strings.ToLower(msg.Scope)
+		msg.Scope = strings.ToLower(strings.TrimSpace(msg.Scope))
+	}
 
-		// Fix generic scopes
-		if replacement, ok := genericSubjects[msg.Scope]; ok {
-			msg.Scope = replacement
+	msg.Body = strings.TrimSpace(msg.Body)
+	return msg
+}
+
+// hasInnerUpper reports whether a word contains an uppercase letter after its first
+// character, which marks it as an acronym or a camel-case identifier.
+func hasInnerUpper(word string) bool {
+	for _, r := range word[1:] {
+		if unicode.IsUpper(r) {
+			return true
+		}
+	}
+	return false
+}
+
+// fitSubject shortens an over-long subject at a word boundary, preferring to drop a
+// trailing clause over cutting mid-word or appending an ellipsis.
+func fitSubject(msg CommitMessage, cfg *config.Config) string {
+	prefix := 0
+	if cfg.Commit.Convention == config.ConventionalCommits && msg.Type != "" {
+		prefix = len(msg.Type) + 2 // "type: "
+		if msg.Scope != "" {
+			prefix += len(msg.Scope) + 2 // "(scope)"
 		}
 	}
 
-	return msg
+	available := cfg.Commit.MaxLength - prefix
+	if available <= 0 || len(msg.Subject) <= available {
+		return msg.Subject
+	}
+
+	// Cut after the last clause separator or word boundary that still fits.
+	cut := msg.Subject[:available]
+	for _, sep := range []string{" - ", ", ", " and ", " "} {
+		if i := strings.LastIndex(cut, sep); i > available/2 {
+			return strings.TrimRight(msg.Subject[:i], " ,;-")
+		}
+	}
+	return strings.TrimRight(cut, " ,;-")
+}
+
+// trimBodyToBullets shortens an over-long body by dropping whole trailing bullets
+// rather than cutting mid-sentence, so every bullet that survives is still readable.
+func trimBodyToBullets(body string, maxLen int) string {
+	lines := strings.Split(strings.TrimSpace(body), "\n")
+	var kept []string
+	total := 0
+
+	for _, line := range lines {
+		cost := len(line) + 1
+		if total+cost > maxLen {
+			break
+		}
+		kept = append(kept, line)
+		total += cost
+	}
+
+	if len(kept) == 0 {
+		// A single bullet longer than the whole budget: cut it at a word boundary.
+		if len(lines) > 0 && len(lines[0]) > maxLen && maxLen > 0 {
+			cut := lines[0][:maxLen]
+			if i := strings.LastIndex(cut, " "); i > 0 {
+				return cut[:i]
+			}
+			return cut
+		}
+		return strings.TrimSpace(body)
+	}
+
+	return strings.Join(kept, "\n")
 }
 
 // isValidCommitType checks if a string is a valid conventional commit type

@@ -33,13 +33,6 @@ func httpClientForConfig(cfg *config.Config) *http.Client {
 // It handles provider-specific prompt formatting uniformly for both summarization and final commit generation.
 // For the final commit message generation, streaming is enabled to show output as it arrives.
 func CallLLM(cfg *config.Config, systemPrompt, userPrompt string) (string, error) {
-	// Add the universal length requirement prefix that used to be duplicated per-provider
-	lengthPrefix := fmt.Sprintf("CRITICAL INSTRUCTION: Your output must be concise and fit within token limits. " +
-		"Preserve all critical information including file paths, function names, and BREAKING CHANGE markers. " +
-		"If summarizing, keep the summary focused on what actually changed.")
-
-	systemPrompt = lengthPrefix + "\n\n" + systemPrompt
-
 	switch cfg.AI.Provider {
 	case config.OpenAI:
 		return callOpenAI(cfg, systemPrompt, userPrompt, true)
@@ -218,9 +211,9 @@ func callOpenAI(cfg *config.Config, systemPrompt, userPrompt string, stream bool
 		}
 
 		if strings.Contains(errorMessage, "maximum context length") || strings.Contains(errorMessage, "context_length_exceeded") {
-			return "", fmt.Errorf("OpenAI API error: %s\n\nChangeset too large even after hierarchical summarization. Consider:\n"+
-				"  1. Split into smaller commits\n"+
-				"  2. Reduce max_input_tokens in your config\n"+
+			return "", fmt.Errorf("OpenAI API error: %s\n\nChangeset too large even after diff compaction. Consider:\n"+
+				"  1. Reduce max_diff_tokens in your config\n"+
+				"  2. Split into smaller commits\n"+
 				"  3. Disable include_diff temporarily", errorMessage)
 		}
 
@@ -524,47 +517,11 @@ func callClaude(cfg *config.Config, systemPrompt, userPrompt string) (string, er
 	return content, nil
 }
 
-// summarizeCall performs a single non-streaming LLM call for summarization steps.
-// It is a package-level var so tests can inject a fake LLM without a live provider.
-var summarizeCall = func(cfg *config.Config, systemPrompt, userPrompt string) (string, error) {
-	// For non-streaming summarization, call directly with streaming disabled
-	switch cfg.AI.Provider {
-	case config.OpenAI:
-		return callOpenAI(cfg, systemPrompt, userPrompt, false)
-	case config.Ollama:
-		return callOllama(cfg, systemPrompt, userPrompt, false)
-	default:
-		return CallLLM(cfg, systemPrompt, userPrompt)
-	}
-}
-
 // withMaxTokens returns a shallow copy of cfg with the response token cap overridden.
-// Summarization calls must not inherit the user's large response budget (meant for the
-// final commit message): an uncapped max_tokens lets the model generate tens of thousands
-// of tokens per summary, which is the dominant cost on local serial inference servers.
+// The commit-message call must not inherit a context-sized max_tokens: generation is
+// billed in wall time, and an uncapped budget only gives the model room to run long.
 func withMaxTokens(cfg *config.Config, maxTokens int) *config.Config {
 	c := *cfg
 	c.AI.MaxTokens = maxTokens
 	return &c
-}
-
-// callLLMWithRetry calls summarizeCall with retries and exponential backoff on failure.
-// Used for summarization steps where individual failures can be retried.
-// Summarization never uses streaming since we just need the full summary to continue.
-func callLLMWithRetry(cfg *config.Config, systemPrompt, userPrompt string, maxRetries int) (string, error) {
-	var lastErr error
-	for i := 0; i <= maxRetries; i++ {
-		result, err := summarizeCall(cfg, systemPrompt, userPrompt)
-
-		if err == nil {
-			return result, nil
-		}
-		lastErr = err
-		if i < maxRetries {
-			backoff := time.Duration(200*(1<<i)) * time.Millisecond
-			time.Sleep(backoff)
-			debugPrint(cfg, "LLM CALL RETRY", fmt.Sprintf("Attempt %d failed: %v, retrying in %v", i+1, err, backoff))
-		}
-	}
-	return "", fmt.Errorf("LLM call failed after %d retries: %w", maxRetries, lastErr)
 }
