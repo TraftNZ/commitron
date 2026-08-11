@@ -351,6 +351,13 @@ If you see "No staged files found" but have changes:
 - Reduce `context.max_diff_tokens` — prompt evaluation is usually the slow part
 - Reduce `ai.max_tokens` if the endpoint spends too long generating
 
+**"model produced no commit message":**
+Reasoning models spend thinking tokens against the same ceiling as the message, so a
+budget sized for the message alone gets consumed before any message is emitted.
+- Increase `ai.reasoning_max_tokens` (default 4000)
+- Raise `ai.max_tokens` if you set it below the message budget
+- Set `ai.reasoning_max_tokens: 0` for models that do not reason
+
 ### Debug Mode
 
 Enable detailed logging:

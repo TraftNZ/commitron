@@ -2,6 +2,7 @@ package ai
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os/exec"
 	"path/filepath"
@@ -431,13 +432,20 @@ func ParseCommitMessageJSON(response string) (CommitMessage, error) {
 
 	response = sanitizeResponse(response)
 
+	// A JSON object only counts as a commit message once it carries a subject. When one
+	// parses but has no subject the response is a failed generation, not free text: the
+	// text parser would otherwise read the raw braces as "type: subject" and produce a
+	// commit message made of JSON punctuation.
 	// First try to extract JSON from the response if it contains other text
 	jsonStr := extractJSON(response)
 	if jsonStr != "" {
 		// Try to unmarshal the extracted JSON
-		if err := json.Unmarshal([]byte(jsonStr), &msg); err == nil {
-			// Successfully parsed extracted JSON
-			return msg, nil
+		var candidate CommitMessage
+		if err := json.Unmarshal([]byte(jsonStr), &candidate); err == nil {
+			if strings.TrimSpace(candidate.Subject) == "" {
+				return candidate, fmt.Errorf("model returned a JSON object with no subject")
+			}
+			return candidate, nil
 		} else {
 			parseErr = err
 		}
@@ -445,6 +453,9 @@ func ParseCommitMessageJSON(response string) (CommitMessage, error) {
 
 	// Next, try to unmarshal the whole response as JSON
 	if err := json.Unmarshal([]byte(response), &msg); err == nil {
+		if strings.TrimSpace(msg.Subject) == "" {
+			return msg, fmt.Errorf("model returned a JSON response with no subject")
+		}
 		// Successfully parsed whole response as JSON
 		return msg, nil
 	} else if parseErr == nil {
@@ -454,10 +465,12 @@ func ParseCommitMessageJSON(response string) (CommitMessage, error) {
 	// If both JSON parsing attempts failed, try to parse as text
 	extractedMsg := parseTextCommitMessage(response)
 
-	// Check if we extracted anything meaningful
-	if extractedMsg.Subject == "" && extractedMsg.Type == "" {
-		// Nothing useful extracted, return error
-		return extractedMsg, fmt.Errorf("failed to parse response as JSON: %v", parseErr)
+	// A response with no subject carries no commit message, whatever type was defaulted
+	// onto it. Returning one anyway is how an empty completion became a bare "chore:"
+	// commit: parseTextCommitMessage always fills in a type, so a type-only check here
+	// never fired and the caller saw success.
+	if strings.TrimSpace(extractedMsg.Subject) == "" {
+		return extractedMsg, fmt.Errorf("no commit subject found in model response: %v", parseErr)
 	}
 
 	// Return the text-parsed message with no error
@@ -845,7 +858,8 @@ const (
 )
 
 // responseTokenBudget returns the generation cap for the final commit-message call:
-// enough for the configured body, but never the user's full context-sized budget.
+// enough for the configured body plus a reasoning model's thinking, but never the
+// user's full context-sized budget.
 func responseTokenBudget(cfg *config.Config) int {
 	needed := 200 // subject, formatting and a short body
 	if cfg.Commit.IncludeBody && cfg.Commit.MaxBodyLength > 0 {
@@ -854,11 +868,27 @@ func responseTokenBudget(cfg *config.Config) int {
 	if needed > maxResponseTokens {
 		needed = maxResponseTokens
 	}
+	// Reasoning tokens are billed against the same ceiling as the visible answer, so a
+	// cap sized for the message alone lets a reasoning model think until it is cut off
+	// having emitted no message at all.
+	if cfg.AI.ReasoningMaxTokens > 0 {
+		needed += cfg.AI.ReasoningMaxTokens
+	}
 	// Respect an explicitly smaller user setting, but never inherit a huge one.
 	if cfg.AI.MaxTokens > 0 && cfg.AI.MaxTokens < needed {
 		return cfg.AI.MaxTokens
 	}
 	return needed
+}
+
+// generationBudgetHint names the setting that actually capped generation. An explicit
+// ai.max_tokens below the computed budget is the binding limit, so pointing at
+// ai.reasoning_max_tokens there would send the user to a knob that changes nothing.
+func generationBudgetHint(cfg *config.Config, budget int) string {
+	if cfg.AI.MaxTokens > 0 && cfg.AI.MaxTokens <= budget {
+		return fmt.Sprintf("Raise ai.max_tokens (currently %d)", cfg.AI.MaxTokens)
+	}
+	return fmt.Sprintf("Raise ai.reasoning_max_tokens (currently %d)", cfg.AI.ReasoningMaxTokens)
 }
 
 // GenerateCommitMessage generates a commit message using the configured AI provider
@@ -971,6 +1001,10 @@ func GenerateCommitMessage(cfg *config.Config, files []string, changes string) (
 
 	if err != nil {
 		debugPrint(cfg, "AI ERROR", err.Error())
+		if errors.Is(err, ErrEmptyCompletion) {
+			return "", fmt.Errorf("%w.\n%s in ~/.commitronrc, or use a model with less verbose reasoning",
+				err, generationBudgetHint(cfg, responseTokens))
+		}
 		return "", err
 	}
 
@@ -981,6 +1015,10 @@ func GenerateCommitMessage(cfg *config.Config, files []string, changes string) (
 
 	// Debug: Show the raw response from the AI
 	debugPrint(cfg, "AI RESPONSE", rawResponse)
+
+	if strings.TrimSpace(rawResponse) == "" {
+		return "", fmt.Errorf("AI returned an empty response; no commit message was generated")
+	}
 
 	// Parse the response into a structured CommitMessage
 	commitMsg, err := ParseCommitMessageJSON(rawResponse)
@@ -1019,6 +1057,13 @@ func GenerateCommitMessage(cfg *config.Config, files []string, changes string) (
 		} else {
 			return rawResponse, nil // Fall back to raw response if parsing fails for non-conventional format
 		}
+	}
+
+	// Never write a commit whose subject the model did not supply. Every recovery path
+	// above defaults a type, so without this check a response that yielded no subject
+	// would be committed as a bare "chore:".
+	if strings.TrimSpace(commitMsg.Subject) == "" {
+		return "", fmt.Errorf("could not extract a commit subject from the model response; nothing was committed")
 	}
 
 	// Debug: Show the parsed commit message

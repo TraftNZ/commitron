@@ -215,11 +215,70 @@ func TestResponseTokenBudget_IsBounded(t *testing.T) {
 
 	got := responseTokenBudget(cfg)
 
-	if got > maxResponseTokens {
-		t.Errorf("response budget %d exceeds cap %d", got, maxResponseTokens)
+	if ceiling := maxResponseTokens + cfg.AI.ReasoningMaxTokens; got > ceiling {
+		t.Errorf("response budget %d exceeds cap %d", got, ceiling)
+	}
+	if got >= cfg.AI.MaxTokens {
+		t.Errorf("response budget %d inherited the context-sized max_tokens %d", got, cfg.AI.MaxTokens)
 	}
 	if got < 200 {
 		t.Errorf("response budget %d is too small to hold a message", got)
+	}
+}
+
+// A reasoning model spends its thinking against the same ceiling as the message, so the
+// budget must carry headroom beyond what the message itself needs. Without it the model
+// is cut off mid-thought having emitted nothing, which used to commit a bare "chore:".
+func TestResponseTokenBudget_ReservesReasoningHeadroom(t *testing.T) {
+	cfg := conventionalCfg()
+	cfg.AI.MaxTokens = 32768
+	cfg.Commit.MaxBodyLength = 8000
+
+	withReasoning := responseTokenBudget(cfg)
+
+	cfg.AI.ReasoningMaxTokens = 0
+	withoutReasoning := responseTokenBudget(cfg)
+
+	if withReasoning-withoutReasoning != config.DefaultReasoningMaxTokens {
+		t.Errorf("headroom not reserved: %d with reasoning, %d without", withReasoning, withoutReasoning)
+	}
+}
+
+// A response carrying no subject must be reported as a failure. parseTextCommitMessage
+// always defaults a type, so a message with an empty subject used to be returned as a
+// success and committed as a bare "chore:".
+func TestParseCommitMessageJSON_RejectsSubjectlessResponses(t *testing.T) {
+	tests := []struct {
+		name string
+		in   string
+	}{
+		{"empty", ""},
+		{"whitespace", "   \n\t\n  "},
+		{"unterminated reasoning block", "<think>\nthe diff deletes two files, so maybe refactor"},
+		{"json without a subject", `{"type": "chore", "scope": "", "subject": ""}`},
+		{"fence with nothing in it", "```\n```"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := ParseCommitMessageJSON(tt.in)
+			if err == nil {
+				t.Errorf("expected an error, got message %+v", got)
+			}
+		})
+	}
+}
+
+func TestParseCommitMessageJSON_KeepsValidResponses(t *testing.T) {
+	got, err := ParseCommitMessageJSON("feat(ai): add reasoning headroom\n\n- widen the response budget")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if got.Type != "feat" || got.Scope != "ai" || got.Subject != "add reasoning headroom" {
+		t.Errorf("parsed wrongly: %+v", got)
+	}
+	if !strings.Contains(got.Body, "widen the response budget") {
+		t.Errorf("body lost: %q", got.Body)
 	}
 }
 

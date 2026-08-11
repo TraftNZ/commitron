@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -70,7 +71,8 @@ func callOpenAI(cfg *config.Config, systemPrompt, userPrompt string, stream bool
 
 	type ChunkResponse struct {
 		Choices []struct {
-			Delta ChunkDelta `json:"delta"`
+			Delta        ChunkDelta `json:"delta"`
+			FinishReason string     `json:"finish_reason"`
 		} `json:"choices"`
 	}
 
@@ -134,6 +136,8 @@ func callOpenAI(cfg *config.Config, systemPrompt, userPrompt string, stream bool
 	// Handle streaming response
 	if stream {
 		var fullContent strings.Builder
+		var finishReason string
+		sawReasoning := false
 		scanner := bufio.NewScanner(resp.Body)
 
 		fmt.Printf("\033[1;36m💬 Generating:\033[0m\n")
@@ -153,8 +157,13 @@ func callOpenAI(cfg *config.Config, systemPrompt, userPrompt string, stream bool
 			}
 
 			if len(chunk.Choices) > 0 {
-				delta := chunk.Choices[0].Delta
+				choice := chunk.Choices[0]
+				if choice.FinishReason != "" {
+					finishReason = choice.FinishReason
+				}
+				delta := choice.Delta
 				if delta.ReasoningContent != "" {
+					sawReasoning = true
 					// Print reasoning in dim gray to distinguish from final content
 					fmt.Printf("\033[38;5;244m%s\033[0m", delta.ReasoningContent)
 					os.Stdout.Sync()
@@ -169,8 +178,14 @@ func callOpenAI(cfg *config.Config, systemPrompt, userPrompt string, stream bool
 		}
 
 		fmt.Println() // Final newline
+		if err := scanner.Err(); err != nil {
+			return "", err
+		}
 		content := strings.TrimSpace(fullContent.String())
-		return content, scanner.Err()
+		if content == "" {
+			return "", emptyCompletionError(cfg, finishReason, sawReasoning)
+		}
+		return content, nil
 	}
 
 	// Non-streaming response
@@ -184,8 +199,10 @@ func callOpenAI(cfg *config.Config, systemPrompt, userPrompt string, stream bool
 	type FullResponse struct {
 		Choices []struct {
 			Message struct {
-				Content string `json:"content"`
+				Content          string `json:"content"`
+				ReasoningContent string `json:"reasoning_content"`
 			} `json:"message"`
+			FinishReason string `json:"finish_reason"`
 		} `json:"choices"`
 		Error json.RawMessage `json:"error,omitempty"`
 	}
@@ -224,8 +241,34 @@ func callOpenAI(cfg *config.Config, systemPrompt, userPrompt string, stream bool
 		return "", fmt.Errorf("no response from OpenAI API")
 	}
 
-	content := strings.TrimSpace(response.Choices[0].Message.Content)
+	choice := response.Choices[0]
+	content := strings.TrimSpace(choice.Message.Content)
+	if content == "" {
+		return "", emptyCompletionError(cfg, choice.FinishReason, choice.Message.ReasoningContent != "")
+	}
 	return content, nil
+}
+
+// ErrEmptyCompletion marks a provider response that carried no message text. The caller
+// knows which setting capped generation and appends the advice; this layer only reports
+// what the provider did.
+var ErrEmptyCompletion = errors.New("model produced no commit message")
+
+// emptyCompletionError explains a completion that carried no commit message. The common
+// cause is a reasoning model spending the whole max_tokens ceiling on thinking: the
+// endpoint returns a well-formed response whose content is empty, which downstream
+// parsing would otherwise turn into a bare "chore:" commit.
+func emptyCompletionError(cfg *config.Config, finishReason string, sawReasoning bool) error {
+	switch {
+	case finishReason == "length" && sawReasoning:
+		return fmt.Errorf("%w: it spent the entire %d-token generation budget on reasoning and was cut off", ErrEmptyCompletion, cfg.AI.MaxTokens)
+	case finishReason == "length":
+		return fmt.Errorf("%w: generation hit the %d-token limit before emitting any content", ErrEmptyCompletion, cfg.AI.MaxTokens)
+	case sawReasoning:
+		return fmt.Errorf("%w: it returned reasoning and no message (finish reason: %q)", ErrEmptyCompletion, finishReason)
+	default:
+		return fmt.Errorf("%w: the response was empty (finish reason: %q)", ErrEmptyCompletion, finishReason)
+	}
 }
 
 // callGemini makes a request to Google Gemini API with concatenated prompts
@@ -333,8 +376,9 @@ func callOllama(cfg *config.Config, systemPrompt, userPrompt string, stream bool
 	}
 
 	type ChunkResponse struct {
-		Response string `json:"response"`
-		Done     bool   `json:"done"`
+		Response   string `json:"response"`
+		Done       bool   `json:"done"`
+		DoneReason string `json:"done_reason"`
 	}
 
 	ollamaHost := cfg.AI.OllamaHost
@@ -379,6 +423,7 @@ func callOllama(cfg *config.Config, systemPrompt, userPrompt string, stream bool
 	// Handle streaming response
 	if stream {
 		var fullContent strings.Builder
+		var doneReason string
 		scanner := bufio.NewScanner(resp.Body)
 
 		fmt.Printf("\033[1;36m💬 Generating:\033[0m\n")
@@ -397,13 +442,20 @@ func callOllama(cfg *config.Config, systemPrompt, userPrompt string, stream bool
 			}
 
 			if chunk.Done {
+				doneReason = chunk.DoneReason
 				break
 			}
 		}
 
 		fmt.Println() // Final newline
+		if err := scanner.Err(); err != nil {
+			return "", err
+		}
 		content := strings.TrimSpace(fullContent.String())
-		return content, scanner.Err()
+		if content == "" {
+			return "", emptyCompletionError(cfg, doneReason, false)
+		}
+		return content, nil
 	}
 
 	// Non-streaming response
@@ -415,8 +467,9 @@ func callOllama(cfg *config.Config, systemPrompt, userPrompt string, stream bool
 	debugPrint(cfg, "OLLAMA RAW RESPONSE", string(respData))
 
 	type FullResponse struct {
-		Model    string `json:"model"`
-		Response string `json:"response"`
+		Model      string `json:"model"`
+		Response   string `json:"response"`
+		DoneReason string `json:"done_reason"`
 	}
 
 	var response FullResponse
@@ -426,6 +479,9 @@ func callOllama(cfg *config.Config, systemPrompt, userPrompt string, stream bool
 	}
 
 	content := strings.TrimSpace(response.Response)
+	if content == "" {
+		return "", emptyCompletionError(cfg, response.DoneReason, false)
+	}
 	return content, nil
 }
 

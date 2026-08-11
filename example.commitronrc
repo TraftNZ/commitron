@@ -15,6 +15,10 @@ ai:
   debug: false
   # Maximum tokens in AI response (increase for longer commit messages or more complex changes)
   max_tokens: 8000
+  # Extra generation budget for a reasoning model's thinking. Reasoning tokens count
+  # against the same ceiling as the message, so without headroom the model can be cut
+  # off mid-thought having emitted nothing. Set to 0 for models that do not reason.
+  reasoning_max_tokens: 4000
   # HTTP request timeout for AI provider calls, in seconds
   request_timeout_seconds: 300
   # Optional custom system prompt - overrides default AI instructions

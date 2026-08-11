@@ -33,6 +33,13 @@ const (
 	Claude AIProvider = "claude"
 )
 
+// DefaultReasoningMaxTokens is the generation budget reserved for a reasoning model's
+// thinking. Providers bill reasoning tokens against the same max_tokens ceiling as the
+// visible answer, so a cap sized for the commit message alone lets a reasoning model
+// think until it is cut off having emitted nothing. The ceiling is not a target: a model
+// that does not reason still stops at its stop token, so unused headroom costs nothing.
+const DefaultReasoningMaxTokens = 4000
+
 // Config represents the application configuration
 type Config struct {
 	// AI provider configuration
@@ -46,6 +53,7 @@ type Config struct {
 		SystemPrompt          string     `yaml:"system_prompt"`
 		Debug                 bool       `yaml:"debug,omitempty"`                   // When true, prints debug info about AI requests
 		MaxTokens             int        `yaml:"max_tokens,omitempty"`              // Maximum tokens to generate in response
+		ReasoningMaxTokens    int        `yaml:"reasoning_max_tokens,omitempty"`    // Generation budget reserved for a reasoning model's thinking, on top of the message itself (0 disables)
 		RequestTimeoutSeconds int        `yaml:"request_timeout_seconds,omitempty"` // HTTP request timeout for AI provider calls
 	} `yaml:"ai"`
 
@@ -92,6 +100,7 @@ func DefaultConfig() *Config {
 	cfg.AI.SystemPrompt = ""
 	cfg.AI.Debug = false
 	cfg.AI.MaxTokens = 8000
+	cfg.AI.ReasoningMaxTokens = DefaultReasoningMaxTokens
 	cfg.AI.RequestTimeoutSeconds = 300
 
 	// Default commit settings
@@ -173,10 +182,11 @@ func SaveExampleConfig(path string) error {
 	cfg.AI.Provider = OpenAI
 	cfg.AI.APIKey = "your-api-key-here"
 	cfg.AI.Model = "gpt-3.5-turbo"
-	cfg.AI.Temperature = 0.7           // Example temperature value
-	cfg.AI.Debug = false               // Set to true to see AI prompts and responses
-	cfg.AI.MaxTokens = 8000            // Maximum response tokens
-	cfg.AI.RequestTimeoutSeconds = 300 // HTTP request timeout in seconds
+	cfg.AI.Temperature = 0.7                              // Example temperature value
+	cfg.AI.Debug = false                                  // Set to true to see AI prompts and responses
+	cfg.AI.MaxTokens = 8000                               // Maximum response tokens
+	cfg.AI.ReasoningMaxTokens = DefaultReasoningMaxTokens // Extra budget for reasoning models (0 disables)
+	cfg.AI.RequestTimeoutSeconds = 300                    // HTTP request timeout in seconds
 
 	// Example of a custom system prompt (commented out by default)
 	cfg.AI.SystemPrompt = "# Custom system prompt (uncomment to use)\n# You are an expert developer who writes clear, concise commit messages.\n# Always follow the conventional commits format and be specific."
