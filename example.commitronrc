@@ -46,6 +46,12 @@ commit:
   max_length: 72
   # Maximum length for the commit body - used as guidance to the AI (no hard truncation)
   max_body_length: 5000
+  # Also stage new (untracked) source code files, honouring .gitignore. Other new files,
+  # such as configs, docs and data, still need `git add`
+  auto_stage_new_source: true
+  # Also commit changed submodules, each with its own message, before the parent repository.
+  # Clean submodules are skipped, and so are submodules that are not on a branch
+  auto_commit_submodules: true
   # Only used when convention is 'custom'
   # custom_template: "{{type}}({{scope}}): {{subject}}"
 

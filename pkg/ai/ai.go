@@ -14,6 +14,28 @@ import (
 	"github.com/johnstilia/commitron/pkg/ui"
 )
 
+// bodyWrapWidth is the conventional line width for a git commit body.
+const bodyWrapWidth = 72
+
+// listContinuationIndent aligns wrapped lines of a list item with the text after "- ".
+const listContinuationIndent = "  "
+
+// bodySummaryRules asks for bullets that summarize the commit rather than enumerate its
+// edits. A diff shows what changed but not always why, so the reason is limited to what
+// the diff supports: an invented motive reads as fact in the history forever.
+const bodySummaryRules = "- body: a blank line, then 2-4 \"- \" bullets that summarize the commit as a whole, most important first\n" +
+	"- each bullet is one short point about what a user or teammate will notice, combining related edits; " +
+	"leave out internal refactors, helpers and tests unless they are the point of the commit\n" +
+	"- good bullet: \"- New source files are now committed automatically, so they no longer get left behind\"\n" +
+	"- bad bullet: \"- Add StageNewSourceFiles helper and update commitRepository\"\n" +
+	"- write in plain English that a teammate who has not read the code understands: everyday words " +
+	"and the effect on behaviour rather than how the code was restructured\n" +
+	"- say what the change does and why it was needed; avoid function, type and variable names " +
+	"unless the point cannot be understood without one\n" +
+	"- take the reason from the diff (comments, tests, the bug being fixed, the code removed); " +
+	"if the reason is not evident, state the effect of the change instead of inventing a motive\n" +
+	"- no paragraphs, no line counts, no restating the subject"
+
 // Template constants for different commit message formats
 const (
 	// Base template with common fields
@@ -227,30 +249,56 @@ func FormatCommitMessage(msg CommitMessage, cfg *config.Config) string {
 		result.WriteString(msg.Subject)
 	}
 
-	// Add body if configured and provided - format as bullet points
 	if cfg.Commit.IncludeBody && msg.Body != "" {
 		result.WriteString("\n\n")
-
-		// Format body as bullet points if it's not already formatted
-		bodyLines := strings.Split(strings.TrimSpace(msg.Body), "\n")
-		for _, line := range bodyLines {
-			line = strings.TrimSpace(line)
-			if line != "" {
-				// Add bullet point if not already present
-				if !strings.HasPrefix(line, "- ") && !strings.HasPrefix(line, "* ") {
-					result.WriteString("- ")
-				}
-				result.WriteString(line)
-				result.WriteString("\n")
-			}
-		}
-		// Remove trailing newline
-		resultStr := result.String()
-		result.Reset()
-		result.WriteString(strings.TrimSuffix(resultStr, "\n"))
+		result.WriteString(formatBody(msg.Body))
 	}
 
 	return result.String()
+}
+
+// formatBody wraps the body to bodyWrapWidth, indenting the continuation lines of list
+// items and joining lines the model broke mid-sentence. Prose is kept as prose, since a
+// custom system prompt may ask for it.
+func formatBody(body string) string {
+	var formatted, block []string
+	flushBlock := func() {
+		if len(block) == 0 {
+			return
+		}
+		text := strings.Join(block, " ")
+		if isListItem(text) {
+			wrapped := wrapText(text, bodyWrapWidth, listContinuationIndent)
+			formatted = append(formatted, strings.TrimPrefix(wrapped, listContinuationIndent))
+		} else {
+			formatted = append(formatted, wrapText(text, bodyWrapWidth, ""))
+		}
+		block = nil
+	}
+
+	for _, rawLine := range strings.Split(strings.TrimSpace(body), "\n") {
+		line := strings.TrimSpace(rawLine)
+		switch {
+		case line == "":
+			flushBlock()
+			if len(formatted) > 0 && formatted[len(formatted)-1] != "" {
+				formatted = append(formatted, "")
+			}
+		case isListItem(line):
+			flushBlock()
+			block = []string{line}
+		default:
+			block = append(block, line)
+		}
+	}
+	flushBlock()
+
+	return strings.Join(formatted, "\n")
+}
+
+// isListItem reports whether a body line starts with a list marker.
+func isListItem(line string) bool {
+	return strings.HasPrefix(line, "- ") || strings.HasPrefix(line, "* ")
 }
 
 // GenerateTextPrompt creates the user message for commit message generation.
@@ -263,13 +311,15 @@ func GenerateTextPrompt(cfg *config.Config, files []string, changes string) stri
 	var p []string
 
 	if cfg.Commit.Convention == config.ConventionalCommits {
+		bodyFormat := ""
+		if cfg.Commit.IncludeBody {
+			bodyFormat = "<blank line>\n- <summary point>\n- <summary point>\n"
+		}
 		p = append(p, fmt.Sprintf(
 			"Write a git commit message for the staged changes below.\n\n"+
 				"Format:\n"+
 				"<type>(<optional scope>): <subject>\n"+
-				"<blank line>\n"+
-				"- bullet\n"+
-				"- bullet\n\n"+
+				"%s\n"+
 				"Rules:\n"+
 				"- type is exactly one of: feat, fix, docs, style, refactor, perf, test, build, ci, chore, revert\n"+
 				"- scope is optional, lowercase, one word naming the area touched (e.g. ai, git, config)\n"+
@@ -277,7 +327,7 @@ func GenerateTextPrompt(cfg *config.Config, files []string, changes string) stri
 				"(type, scope, colon and subject together) must be under %d characters\n"+
 				"- pick the type from what the change actually does; if it does several things, "+
 				"pick the one a reader would care about most",
-			cfg.Commit.MaxLength))
+			bodyFormat, cfg.Commit.MaxLength))
 	} else {
 		p = append(p, fmt.Sprintf(
 			"Write a git commit message for the staged changes below.\n\n"+
@@ -287,16 +337,8 @@ func GenerateTextPrompt(cfg *config.Config, files []string, changes string) stri
 	}
 
 	if cfg.Commit.IncludeBody {
-		p = append(p, fmt.Sprintf(
-			"- body: a blank line, then one \"- \" bullet per meaningful change, most important first\n"+
-				"- each bullet names what concretely changed (the function, type, flag, endpoint or "+
-				"behaviour) and what it does now - a reader who cannot see the diff should understand "+
-				"the change from the bullet alone\n"+
-				"- cover every significant change, grouping trivial related edits into one bullet\n"+
-				"- explain *why* where the diff makes it clear (a fix, a bound, a removed workaround)\n"+
-				"- no line counts, no bare file listings, no \"+X/-Y\", no restating the subject\n"+
-				"- keep the body under %d characters",
-			cfg.Commit.MaxBodyLength))
+		p = append(p, fmt.Sprintf("%s\n- keep the body under %d characters",
+			bodySummaryRules, cfg.Commit.MaxBodyLength))
 	} else {
 		p = append(p, "- output the subject line only, no body")
 	}
@@ -848,7 +890,7 @@ const (
 	minDiffBudgetTokens = 500
 
 	// maxResponseTokens caps generation for the final call. A commit message with a
-	// full bulleted body runs a few hundred tokens; local endpoints generate at
+	// full body runs a few hundred tokens; local endpoints generate at
 	// roughly 10-50 tok/s, so an oversized cap only lets the model run long.
 	maxResponseTokens = 1500
 
@@ -1088,7 +1130,7 @@ func GenerateCommitMessage(cfg *config.Config, files []string, changes string) (
 	commitMsg.Subject = fitSubject(commitMsg, cfg)
 
 	if cfg.Commit.IncludeBody && cfg.Commit.MaxBodyLength > 0 && len(commitMsg.Body) > cfg.Commit.MaxBodyLength {
-		commitMsg.Body = trimBodyToBullets(commitMsg.Body, cfg.Commit.MaxBodyLength)
+		commitMsg.Body = trimBody(commitMsg.Body, cfg.Commit.MaxBodyLength)
 		debugPrint(cfg, "TRIMMED BODY", commitMsg.Body)
 	}
 
@@ -1226,7 +1268,7 @@ func buildPrompt(cfg *config.Config, files []string, changes string) string {
 		// Add explicit instructions to return ONLY valid JSON
 		bodyInstructions := ""
 		if cfg.Commit.IncludeBody {
-			bodyInstructions = "YOU MUST INCLUDE A BODY formatted as a bulleted list, with every bullet starting with '- '. Include one bullet per meaningful change and cover ALL significant changes across the diff - more files/areas touched means more bullets. Each bullet must be specific and technical about what actually changed (name the component, function, or behavior). DO NOT include line statistics or formatting details like '+X/-Y lines'. DO NOT include raw metadata from the diff. NO marketing language or fluffy descriptions. "
+			bodyInstructions = "YOU MUST INCLUDE A BODY, following these rules:\n" + bodySummaryRules + "\nNO marketing language or fluffy descriptions. "
 		} else {
 			bodyInstructions = "DO NOT include a body. "
 		}
@@ -1315,7 +1357,7 @@ func extractKeyDiffContent(diff string) string {
 // bodyExample returns the appropriate body example text based on whether body is included
 func bodyExample(includeBody bool) string {
 	if includeBody {
-		return "- Added validation to ensure commit messages follow the conventional commit format\\n- Improved error handling for malformed messages\\n- Added automatic truncation of overly long subject lines"
+		return "- Check commit messages against the conventional commit format before committing\\n- Stop badly formed messages reaching the history, which happened because any first line was accepted"
 	}
 	return "leave empty"
 }
@@ -1791,35 +1833,26 @@ func fitSubject(msg CommitMessage, cfg *config.Config) string {
 	return strings.TrimRight(cut, " ,;-")
 }
 
-// trimBodyToBullets shortens an over-long body by dropping whole trailing bullets
-// rather than cutting mid-sentence, so every bullet that survives is still readable.
-func trimBodyToBullets(body string, maxLen int) string {
-	lines := strings.Split(strings.TrimSpace(body), "\n")
-	var kept []string
-	total := 0
-
-	for _, line := range lines {
-		cost := len(line) + 1
-		if total+cost > maxLen {
-			break
-		}
-		kept = append(kept, line)
-		total += cost
+// trimBody shortens an over-long body at the last boundary that leaves it readable: a
+// whole list item for a bulleted body, a whole sentence for prose, else a whole word.
+func trimBody(body string, maxLen int) string {
+	body = strings.TrimSpace(body)
+	if maxLen <= 0 || len(body) <= maxLen {
+		return body
 	}
 
-	if len(kept) == 0 {
-		// A single bullet longer than the whole budget: cut it at a word boundary.
-		if len(lines) > 0 && len(lines[0]) > maxLen && maxLen > 0 {
-			cut := lines[0][:maxLen]
-			if i := strings.LastIndex(cut, " "); i > 0 {
-				return cut[:i]
-			}
-			return cut
+	cut := body[:maxLen]
+	if isListItem(body) {
+		if i := strings.LastIndex(cut, "\n"); i > 0 {
+			return cut[:i]
 		}
-		return strings.TrimSpace(body)
+	} else if i := max(strings.LastIndex(cut, ". "), strings.LastIndex(cut, ".\n")); i > 0 {
+		return cut[:i+1]
 	}
-
-	return strings.Join(kept, "\n")
+	if i := strings.LastIndexAny(cut, " \n"); i > 0 {
+		return cut[:i]
+	}
+	return cut
 }
 
 // isValidCommitType checks if a string is a valid conventional commit type

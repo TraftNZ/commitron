@@ -156,12 +156,12 @@ func TestFitSubject_ShortSubjectUntouched(t *testing.T) {
 	}
 }
 
-func TestTrimBodyToBullets(t *testing.T) {
+func TestTrimBody_DropsWholeBullets(t *testing.T) {
 	body := "- first bullet explaining a real change\n" +
 		"- second bullet explaining another change\n" +
 		"- third bullet that will not fit"
 
-	got := trimBodyToBullets(body, 80)
+	got := trimBody(body, 80)
 
 	if len(got) > 80 {
 		t.Errorf("body still over limit: %d chars", len(got))
@@ -177,6 +177,92 @@ func TestTrimBodyToBullets(t *testing.T) {
 		if !strings.HasPrefix(line, "- ") {
 			t.Errorf("line was cut mid-bullet: %q", line)
 		}
+	}
+}
+
+func TestTrimBody_ProseEndsOnSentence(t *testing.T) {
+	body := "Compact diffs without calling the model. Each extra call costs a full prompt evaluation on local servers."
+
+	got := trimBody(body, 60)
+
+	if got != "Compact diffs without calling the model." {
+		t.Errorf("expected a cut at the sentence boundary, got %q", got)
+	}
+}
+
+func TestTrimBody_SingleSentenceEndsOnWord(t *testing.T) {
+	got := trimBody("compact diffs without calling the model", 20)
+
+	if got != "compact diffs" {
+		t.Errorf("expected a cut at the word boundary, got %q", got)
+	}
+}
+
+func TestFormatCommitMessage_ProseBodyIsWrappedNotBulleted(t *testing.T) {
+	cfg := conventionalCfg()
+	msg := CommitMessage{
+		Type:    "refactor",
+		Scope:   "ai",
+		Subject: "compact diffs deterministically",
+		Body: "Replace LLM summarization with deterministic compaction so large diffs fit the budget.\n" +
+			"Each summarization call cost a full prompt evaluation on local servers, which dominated latency.",
+	}
+
+	got := FormatCommitMessage(msg, cfg)
+
+	subject, body, found := strings.Cut(got, "\n\n")
+	if !found || subject != "refactor(ai): compact diffs deterministically" {
+		t.Fatalf("unexpected subject formatting:\n%s", got)
+	}
+	if strings.Contains(body, "\n\n") {
+		t.Errorf("a broken paragraph should be rejoined:\n%s", body)
+	}
+	for _, line := range strings.Split(body, "\n") {
+		if isListItem(line) {
+			t.Errorf("prose was turned into a list item: %q", line)
+		}
+		if len(line) > bodyWrapWidth {
+			t.Errorf("line exceeds %d chars: %q", bodyWrapWidth, line)
+		}
+	}
+	if !strings.Contains(strings.Join(strings.Fields(body), " "), "evaluation on local servers, which dominated latency.") {
+		t.Errorf("body text was lost:\n%s", body)
+	}
+}
+
+func TestFormatBody_WrapsBulletsWithHangingIndent(t *testing.T) {
+	first := "- Stage new source files automatically so a commit no longer leaves them behind by accident"
+	second := "- Skip submodules with no changes"
+
+	lines := strings.Split(formatBody(first+"\n"+second), "\n")
+
+	if !strings.HasPrefix(lines[0], "- Stage") || !strings.HasPrefix(lines[1], "  ") {
+		t.Errorf("expected a bullet with an indented continuation, got %q", lines)
+	}
+	if got := lines[len(lines)-1]; got != second {
+		t.Errorf("expected the short bullet untouched, got %q", got)
+	}
+	for _, line := range lines {
+		if len(line) > bodyWrapWidth {
+			t.Errorf("line exceeds %d chars: %q", bodyWrapWidth, line)
+		}
+	}
+}
+
+func TestFormatBody_JoinsBulletBrokenAcrossLines(t *testing.T) {
+	got := formatBody("- Skip clean\n  submodules\n- Stop on failure")
+
+	if want := "- Skip clean submodules\n- Stop on failure"; got != want {
+		t.Errorf("got %q, want %q", got, want)
+	}
+}
+
+func TestFormatCommitMessage_KeepsParagraphBreaks(t *testing.T) {
+	cfg := conventionalCfg()
+	msg := CommitMessage{Type: "fix", Subject: "bound retries", Body: "First paragraph.\n\n\nSecond paragraph."}
+
+	if got, want := FormatCommitMessage(msg, cfg), "fix: bound retries\n\nFirst paragraph.\n\nSecond paragraph."; got != want {
+		t.Errorf("got %q, want %q", got, want)
 	}
 }
 
@@ -305,9 +391,27 @@ func TestGenerateTextPrompt_IsCompact(t *testing.T) {
 	if strings.Count(prompt, "MUST NOT exceed") > 1 {
 		t.Error("length rule is stated more than once")
 	}
-	for _, want := range []string{"feat", "fix", "imperative", "bullet"} {
+	for _, want := range []string{"feat", "fix", "imperative", "summarize", "plain English", "why", "instead of inventing"} {
 		if !strings.Contains(prompt, want) {
 			t.Errorf("prompt lost essential guidance %q", want)
 		}
+	}
+}
+
+func TestGenerateTextPrompt_SubjectOnlyOmitsBodyFormat(t *testing.T) {
+	cfg := conventionalCfg()
+	cfg.Commit.IncludeBody = false
+	cfg.Context.IncludeRecentCommits = 0
+
+	prompt := GenerateTextPrompt(cfg, nil, "")
+
+	if strings.Contains(prompt, "summary point") {
+		t.Errorf("a subject-only prompt should not ask for a body:\n%s", prompt)
+	}
+}
+
+func TestFormatBody_WhitespaceOnly(t *testing.T) {
+	if got := formatBody("  \n "); got != "" {
+		t.Errorf("expected an empty body, got %q", got)
 	}
 }

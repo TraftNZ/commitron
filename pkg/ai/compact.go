@@ -21,6 +21,13 @@ const (
 	// overflows on the note. One note per file (rather than per hunk) keeps the marker
 	// overhead proportional to the number of files, not the number of hunks.
 	elisionNoteTokens = 16
+
+	// submoduleLogBudgetDivisor limits submodule commit subjects to this fraction of the
+	// diff budget, so a large submodule bump cannot crowd out the repository's own changes.
+	submoduleLogBudgetDivisor = 2
+
+	// submoduleLogHeader starts each submodule section of "git diff --submodule=log".
+	submoduleLogHeader = "Submodule "
 )
 
 // compactHunk is one hunk of a file's diff, reduced to its enclosing-symbol trailer
@@ -59,9 +66,44 @@ type compactFileDiff struct {
 // that the output is a single path, which is the smallest truthful answer available.
 // Callers clamp to minDiffBudgetTokens, well above that floor.
 func CompactDiff(diff string, budgetTokens int, tokenizerModel string) string {
+	submoduleLog, diff := splitSubmoduleLog(diff)
+	if submoduleLog != "" {
+		submoduleLog = tokenizer.TruncateToTokenLimit(submoduleLog, budgetTokens/submoduleLogBudgetDivisor, tokenizerModel)
+		budgetTokens -= tokenizer.CountTokens(submoduleLog, tokenizerModel)
+		if compacted := compactFiles(diff, budgetTokens, tokenizerModel); compacted != "" {
+			return submoduleLog + "\n\n" + compacted
+		}
+		return submoduleLog
+	}
+	return compactFiles(diff, budgetTokens, tokenizerModel)
+}
+
+// splitSubmoduleLog separates the submodule sections of a "--submodule=log" diff, which
+// have no file header for the compactor to parse, from the regular file diffs. A diff
+// body line always starts with a marker, so a header at column 0 cannot be file content.
+func splitSubmoduleLog(diff string) (submoduleLog, fileDiffs string) {
+	var logLines, diffLines []string
+	inSection := false
+	for _, line := range strings.Split(diff, "\n") {
+		switch {
+		case strings.HasPrefix(line, submoduleLogHeader):
+			inSection = true
+			logLines = append(logLines, line)
+		case inSection && strings.HasPrefix(line, "  "):
+			logLines = append(logLines, line)
+		default:
+			inSection = false
+			diffLines = append(diffLines, line)
+		}
+	}
+	return strings.Join(logLines, "\n"), strings.Join(diffLines, "\n")
+}
+
+// compactFiles fits regular file diffs within budgetTokens.
+func compactFiles(diff string, budgetTokens int, tokenizerModel string) string {
 	files := buildCompactFiles(diff, tokenizerModel)
 	if len(files) == 0 {
-		return diff
+		return strings.TrimSpace(diff)
 	}
 
 	// Fixed cost: file headers and hunk symbols always survive, they are the skeleton

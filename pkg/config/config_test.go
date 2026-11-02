@@ -62,3 +62,26 @@ func TestDefaultConfig_DiffBudgetDefaults(t *testing.T) {
 		t.Errorf("include_recent_commits default: got %d, want 10", cfg.Context.IncludeRecentCommits)
 	}
 }
+
+func TestAutoStageNewSource_DefaultsOnAndCanBeDisabled(t *testing.T) {
+	if !DefaultConfig().Commit.AutoStageNewSource {
+		t.Error("expected new source files to be staged by default")
+	}
+
+	cfg, err := ParseConfig([]byte("commit:\n  auto_stage_new_source: false\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Commit.AutoStageNewSource {
+		t.Error("expected the setting to be disabled by the config file")
+	}
+
+	// A config written before this setting existed keeps the default.
+	cfg, err = ParseConfig([]byte("commit:\n  max_length: 72\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !cfg.Commit.AutoStageNewSource {
+		t.Error("expected an older config to keep the default")
+	}
+}

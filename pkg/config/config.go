@@ -64,6 +64,10 @@ type Config struct {
 		MaxLength      int              `yaml:"max_length"`
 		MaxBodyLength  int              `yaml:"max_body_length"` // Maximum length for the commit body
 		CustomTemplate string           `yaml:"custom_template,omitempty"`
+		// AutoStageNewSource also stages untracked source files, not just tracked changes.
+		AutoStageNewSource bool `yaml:"auto_stage_new_source"`
+		// AutoCommitSubmodules also commits changed submodules, before the parent repository.
+		AutoCommitSubmodules bool `yaml:"auto_commit_submodules"`
 	} `yaml:"commit"`
 
 	// Additional context to provide to the AI
@@ -108,6 +112,8 @@ func DefaultConfig() *Config {
 	cfg.Commit.IncludeBody = true
 	cfg.Commit.MaxLength = 120
 	cfg.Commit.MaxBodyLength = 5000 // Default maximum body length
+	cfg.Commit.AutoStageNewSource = true
+	cfg.Commit.AutoCommitSubmodules = true
 
 	// Default context settings
 	cfg.Context.IncludeFileNames = true

@@ -19,7 +19,7 @@ AI-powered CLI tool that automatically generates intelligent, context-aware comm
 - 🎯 **Token Optimization**: Handles large changesets (200K+ tokens) with smart summarization
 - 📝 **Narrative Summaries**: Creates concise paragraph summaries explaining what changed and why
 - 🗑️ **Complete Change Tracking**: Mentions both additions and deletions
-- 🚀 **Auto-Staging**: Automatically stages tracked modified files (no manual `git add` needed)
+- 🚀 **Auto-Staging**: Automatically stages modified files and new source code files (no manual `git add` needed)
 - 🔧 **Custom Endpoints**: Works with OpenAI-compatible APIs (LocalAI, vLLM, etc.)
 - 🧩 **Multiple AI Providers**: OpenAI, Claude, Gemini, Ollama (local)
 - 📋 **Commit Conventions**: Conventional Commits, plain text, or custom templates
@@ -95,7 +95,7 @@ ai:
 # Commit message settings
 commit:
   convention: conventional      # conventional, none, custom
-  include_body: true           # Generate summary paragraph
+  include_body: true           # Generate summary bullets
   max_length: 120              # Subject line limit
   max_body_length: 1000        # Body limit
 
@@ -160,7 +160,7 @@ ai:
 ### Basic Usage
 
 ```bash
-# Generate and commit (auto-stages tracked files)
+# Generate and commit (auto-stages modified files and new source files)
 commitron
 
 # Preview message without committing
@@ -196,8 +196,20 @@ to return detailed validation errors with field-level feedback.
 
 ### Auto-Staging Behavior
 
-- **Tracked files only**: Only stages files already tracked by Git
-- **Ignores untracked**: Never stages new files automatically
+- **Tracked files**: Stages all changes to files already tracked by Git
+- **New source files**: Stages untracked source code files (`.go`, `.py`, `.ts`, `Makefile`, ...), honouring `.gitignore` and skipping hidden and generated directories such as `node_modules` and `dist`
+- **Other new files**: Configs, docs and data files are never staged automatically
+- **Opt out**: Set `commit.auto_stage_new_source: false` to stage tracked files only
+
+### Submodules
+
+Running commitron also commits changed submodules, each with its own generated message, including nested ones. The parent repository is committed last, so its commit records the new submodule commits and describes them.
+
+- **Clean submodules**: Skipped
+- **Submodules not on a branch**: Skipped with a warning, because a commit on a detached HEAD is easily lost. Run `git switch <branch>` in the submodule, then rerun
+- **Failures**: Commitron stops before committing the parent. Rerun it to continue
+- **Pushing**: Commitron does not push. Push submodules before the parent, for example with `git push --recurse-submodules=on-demand`
+- **Opt out**: Set `commit.auto_commit_submodules: false` to commit only the current repository
 - **Smart detection**: Uses existing staged files if present
 - **No manual staging**: No need to run `git add` before committing
 
@@ -327,8 +339,8 @@ If you get "maximum context length exceeded" errors:
 
 If you see "No staged files found" but have changes:
 
-- Commitron only auto-stages **tracked** files
-- New/untracked files must be manually added: `git add <file>`
+- Commitron auto-stages **tracked** files and new **source code** files
+- Other new files must be manually added: `git add <file>`
 - Check status: `git status`
 
 ### API Errors

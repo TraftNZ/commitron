@@ -219,3 +219,33 @@ func TestCompactDiff_EmptyAndUnparseableInput(t *testing.T) {
 		t.Errorf("unparseable input should pass through unchanged, got %q", out)
 	}
 }
+
+func TestCompactDiff_KeepsSubmoduleCommitSubjects(t *testing.T) {
+	diff := "Submodule libs/core abc123..def456:\n" +
+		"  > add parser retry\n" +
+		"diff --git a/main.go b/main.go\n" +
+		"index 111..222 100644\n" +
+		"--- a/main.go\n" +
+		"+++ b/main.go\n" +
+		"@@ -1 +1 @@\n" +
+		"-old line\n" +
+		"+new line\n"
+
+	got := CompactDiff(diff, 1000, "gpt-4o")
+
+	for _, want := range []string{"Submodule libs/core", "add parser retry", "main.go", "+new line"} {
+		if !strings.Contains(got, want) {
+			t.Errorf("missing %q in:\n%s", want, got)
+		}
+	}
+}
+
+func TestCompactDiff_SubmoduleOnlyDiff(t *testing.T) {
+	diff := "Submodule libs/core abc123..def456:\n  > add parser retry\n"
+
+	got := CompactDiff(diff, 1000, "gpt-4o")
+
+	if !strings.Contains(got, "add parser retry") {
+		t.Errorf("submodule subject was lost:\n%s", got)
+	}
+}
